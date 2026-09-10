@@ -1606,9 +1606,29 @@ class SettingsDialog(QDialog):
         area_card, area_layout = make_card("캡처 영역")
         self.lbl_area = QLabel("-")
         self.lbl_area.setObjectName("Caption")
+        self.lbl_area.setWordWrap(True)
+        area_layout.addWidget(self.lbl_area)
+
+        # Editable source coordinates, in the game's own pixels.
+        area_grid = QGridLayout()
+        area_grid.setHorizontalSpacing(12)
+        area_grid.setVerticalSpacing(8)
+        self.spin_src_x = self._make_spin(0, 20000, self._commit_source_rect)
+        self.spin_src_y = self._make_spin(0, 20000, self._commit_source_rect)
+        self.spin_src_w = self._make_spin(1, 20000, self._commit_source_rect)
+        self.spin_src_h = self._make_spin(1, 20000, self._commit_source_rect)
+        area_grid.addWidget(QLabel("X"), 0, 0)
+        area_grid.addWidget(self.spin_src_x, 0, 1)
+        area_grid.addWidget(QLabel("Y"), 0, 2)
+        area_grid.addWidget(self.spin_src_y, 0, 3)
+        area_grid.addWidget(QLabel("너비"), 1, 0)
+        area_grid.addWidget(self.spin_src_w, 1, 1)
+        area_grid.addWidget(QLabel("높이"), 1, 2)
+        area_grid.addWidget(self.spin_src_h, 1, 3)
+        area_layout.addLayout(area_grid)
+
         btn_edit_area = QPushButton("영역 다시 지정")
         btn_edit_area.clicked.connect(self._edit_area)
-        area_layout.addWidget(self.lbl_area)
         area_layout.addWidget(btn_edit_area)
         layout.addWidget(area_card)
 
@@ -1637,10 +1657,15 @@ class SettingsDialog(QDialog):
         grid.addWidget(QLabel("높이"), 1, 2)
         grid.addWidget(self.spin_h, 1, 3)
         geom_layout.addLayout(grid)
-        btn_fit = QPushButton("원본 크기로 맞추기")
-        btn_fit.clicked.connect(self._fit_to_region)
-        geom_layout.addWidget(btn_fit)
-        fit_hint = QLabel("확대·축소 없이 게임 화면에 보이던 크기 그대로 표시합니다.")
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(QLabel("배율"))
+        for percent in (100, 150, 200, 300):
+            btn = QPushButton(f"{percent}%")
+            btn.setAutoDefault(False)
+            btn.clicked.connect(lambda _=False, p=percent: self._zoom_to(p))
+            zoom_row.addWidget(btn)
+        geom_layout.addLayout(zoom_row)
+        fit_hint = QLabel("100%는 게임 화면에 보이던 크기 그대로입니다.")
         fit_hint.setObjectName("Caption")
         fit_hint.setWordWrap(True)
         geom_layout.addWidget(fit_hint)
@@ -1781,11 +1806,8 @@ class SettingsDialog(QDialog):
         self.stack.setCurrentIndex(1)
         self._loading += 1
         try:
-            rel, pip = region["rel"], region["pip"]
+            pip = region["pip"]
             self.edit_name.setText(region.get("name", ""))
-            self.lbl_area.setText(
-                f"대상 화면의 {rel['x'] * 100:.1f}%, {rel['y'] * 100:.1f}% 지점 · "
-                f"크기 {rel['w'] * 100:.1f}% x {rel['h'] * 100:.1f}%")
             self.spin_x.setValue(pip["x"])
             self.spin_y.setValue(pip["y"])
             self.spin_w.setValue(pip["w"])
@@ -1796,6 +1818,7 @@ class SettingsDialog(QDialog):
             self.chk_click_through.setChecked(bool(region.get("click_through", False)))
         finally:
             self._loading -= 1
+        self._load_area_fields(region)
         self.update_preview()
 
     def update_preview(self):
@@ -1923,22 +1946,73 @@ class SettingsDialog(QDialog):
             x, y = self.controller.pip_screen_pos(region)
             window.setGeometry(x, y, region["pip"]["w"], region["pip"]["h"])
 
-    def _fit_to_region(self):
+    def _zoom_to(self, percent):
         region = self._selected_region()
         if not region:
             return
-        if not self.controller.target_hwnd:
-            QMessageBox.information(self, "안내", "먼저 대상 프로그램을 지정하세요.")
+        source = self.controller.source_rect_px(region)
+        if not source:
+            QMessageBox.information(self, "안내",
+                                     f"{TARGET_LABEL} 이(가) 실행 중이 아닙니다.")
             return
-        rel = region["rel"]
-        size = self.controller.default_pip_for(rel["w"], rel["h"])
+        dpr = QApplication.primaryScreen().devicePixelRatio() or 1.0
+        max_w, max_h = max_pip_size()
+        scale = percent / 100.0
         self._loading += 1
         try:
-            self.spin_w.setValue(size["w"])
-            self.spin_h.setValue(size["h"])
+            self.spin_w.setValue(max(PipWindow.MIN_SIDE,
+                                      min(max_w, round(source["w"] * scale / dpr))))
+            self.spin_h.setValue(max(PipWindow.MIN_SIDE,
+                                      min(max_h, round(source["h"] * scale / dpr))))
         finally:
             self._loading -= 1
         self._commit_geometry()
+
+    def _commit_source_rect(self):
+        """Typed source coordinates, in the game's pixels."""
+        region = self._selected_region()
+        if not region or self._loading:
+            return
+        size = self.controller.target_client_size()
+        if not size:
+            return
+        cw, ch = size
+        width = max(1, min(self.spin_src_w.value(), cw))
+        height = max(1, min(self.spin_src_h.value(), ch))
+        x = max(0, min(self.spin_src_x.value(), cw - width))
+        y = max(0, min(self.spin_src_y.value(), ch - height))
+        region["rel"] = {"x": x / cw, "y": y / ch, "w": width / cw, "h": height / ch}
+        save_config(self.controller.config)
+        window = self.controller.pip_windows.get(region["id"])
+        if window:
+            window.refresh_thumbnail()
+        self._load_area_fields(region)
+        self.update_preview()
+
+    def _load_area_fields(self, region):
+        source = self.controller.source_rect_px(region)
+        rel = region["rel"]
+        self._loading += 1
+        try:
+            for spin in (self.spin_src_x, self.spin_src_y,
+                          self.spin_src_w, self.spin_src_h):
+                spin.setEnabled(source is not None)
+            if source:
+                self.spin_src_x.setValue(source["x"])
+                self.spin_src_y.setValue(source["y"])
+                self.spin_src_w.setValue(source["w"])
+                self.spin_src_h.setValue(source["h"])
+                self.lbl_area.setText(
+                    f"게임 화면 좌측 상단(0,0) 기준 픽셀 좌표입니다. "
+                    f"화면 비율로는 {rel['x'] * 100:.1f}%, {rel['y'] * 100:.1f}% 지점 · "
+                    f"{rel['w'] * 100:.1f}% x {rel['h'] * 100:.1f}%")
+            else:
+                self.lbl_area.setText(
+                    f"{TARGET_LABEL} 실행 중에만 좌표를 볼 수 있습니다. "
+                    f"화면 비율 {rel['x'] * 100:.1f}%, {rel['y'] * 100:.1f}% 지점 · "
+                    f"{rel['w'] * 100:.1f}% x {rel['h'] * 100:.1f}%")
+        finally:
+            self._loading -= 1
 
     def _commit_opacity(self, value):
         self.lbl_opacity.setText(f"{value}%")
@@ -2369,6 +2443,22 @@ class PipController(QObject):
             if not self.regions_in_preset(i):
                 return i
         return None
+
+    def target_client_size(self):
+        if not self.target_hwnd or not user32.IsWindow(self.target_hwnd):
+            return None
+        cw, ch = client_size_of(self.target_hwnd)
+        return (cw, ch) if cw > 0 and ch > 0 else None
+
+    def source_rect_px(self, region):
+        """The captured area in the game's own pixels, or None when detached."""
+        size = self.target_client_size()
+        if not size:
+            return None
+        cw, ch = size
+        rel = region["rel"]
+        return {"x": round(rel["x"] * cw), "y": round(rel["y"] * ch),
+                "w": max(1, round(rel["w"] * cw)), "h": max(1, round(rel["h"] * ch))}
 
     def slot_rel(self, index):
         """One quick slot as client-relative fractions. index 0..11 -> F1..F12,
