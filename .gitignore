@@ -14,3 +14,6 @@ venv/
 build/
 dist/
 *.spec
+
+# 내부 개발 기록
+IMPROVEMENTS.md
