@@ -1443,17 +1443,6 @@ class SettingsDialog(QDialog):
         opacity_layout.addLayout(opacity_row)
         layout.addWidget(opacity_card)
 
-        move_card, move_layout = make_card("소속 프리셋")
-        self.combo_move = QComboBox()
-        self.combo_move.currentIndexChanged.connect(self._commit_move_preset)
-        move_layout.addWidget(self.combo_move)
-        move_hint = QLabel("영역 좌표는 해당 해상도에서만 맞으므로, 프리셋을 옮기면 "
-                            "영역을 다시 지정해야 할 수 있습니다.")
-        move_hint.setObjectName("Caption")
-        move_hint.setWordWrap(True)
-        move_layout.addWidget(move_hint)
-        layout.addWidget(move_card)
-
         behave_card, behave_layout = make_card("동작")
         self.chk_click_through = QCheckBox("마우스 통과 (PIP를 눌러도 아래 프로그램이 눌림)")
         self.chk_click_through.toggled.connect(self._commit_click_through)
@@ -1503,9 +1492,6 @@ class SettingsDialog(QDialog):
                 self.combo_preset.addItem(self._preset_caption(preset), preset)
             index = self.combo_preset.findData(self.viewing_preset)
             self.combo_preset.setCurrentIndex(max(0, index))
-            self.combo_move.clear()
-            for preset in range(1, PRESET_COUNT + 1):
-                self.combo_move.addItem(self.controller.preset_name(preset), preset)
         finally:
             self._loading -= 1
         self._load_preset_fields()
@@ -1589,8 +1575,6 @@ class SettingsDialog(QDialog):
             self.slider_opacity.setValue(opacity)
             self.lbl_opacity.setText(f"{opacity}%")
             self.chk_click_through.setChecked(bool(region.get("click_through", False)))
-            index = self.combo_move.findData(region.get("preset", 1))
-            self.combo_move.setCurrentIndex(max(0, index))
         finally:
             self._loading -= 1
         self.update_preview()
@@ -1837,18 +1821,6 @@ class SettingsDialog(QDialog):
             entry["name"] = name
             save_config(self.controller.config)
             self.refresh()
-
-    def _commit_move_preset(self, _index):
-        region = self._selected_region()
-        if not region or self._loading:
-            return
-        preset = self.combo_move.currentData()
-        if not preset or preset == region.get("preset"):
-            return
-        region["preset"] = preset
-        save_config(self.controller.config)
-        self.controller.apply_visibility()
-        self.refresh()
 
     def _commit_hotkey(self, hotkey):
         if self._loading:
