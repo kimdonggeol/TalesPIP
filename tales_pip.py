@@ -96,6 +96,16 @@ TARGET_LABEL = "테일즈위버"  # shown in the UI instead of the process name
 DIALOG_CLASS = "#32770"  # standard Win32 dialog (patcher, message boxes)
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 PRESET_COUNT = 4
+# The in-game quick slot bar: F1-F6 on the upper row, F7-F12 below.
+# Measured off a 1920x1200 client; the bar is a fixed-size UI anchored to the
+# bottom-left, so these pixel values hold at any resolution.
+SLOT_COLUMNS, SLOT_ROWS = 6, 2
+SLOT_COUNT = SLOT_COLUMNS * SLOT_ROWS
+SLOT_SIZE = 26          # one cell, px
+SLOT_PITCH_X = 27       # cell + separator
+SLOT_PITCH_Y = 40       # row + its F-key label strip
+SLOT_LEFT = 26          # F1's left edge, from the client's left
+SLOT_BOTTOM = 69        # top of the F1 row, measured up from the client's bottom
 
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -108,7 +118,7 @@ VK_F1 = 0x70
 DEFAULT_TOGGLE_HOTKEY = {"mods": MOD_CONTROL, "vk": 0x7B, "text": "Ctrl+F12"}
 DEFAULT_CONFIG = {
     "always_on_top": True,
-    "refresh_ms": 300,
+    "refresh_ms": 100,
     # Presets follow the game's resolution automatically, so the only
     # shortcut worth a global binding is show/hide.
     "toggle_hotkey": dict(DEFAULT_TOGGLE_HOTKEY),
@@ -547,6 +557,14 @@ QLineEdit, QSpinBox {
     background: #1a1d23; border: 1px solid #2a2f3a; border-radius: 7px;
     padding: 6px 8px; color: #e6e8ee; selection-background-color: #4c7dff;
 }
+/* Reserve the arrows' width, or long values run underneath them. */
+QSpinBox { padding-right: 26px; }
+QSpinBox::up-button, QSpinBox::down-button {
+    subcontrol-origin: border; width: 22px; border: none; background: transparent;
+}
+QSpinBox::up-button { subcontrol-position: top right; margin: 2px 2px 0 0; }
+QSpinBox::down-button { subcontrol-position: bottom right; margin: 0 2px 2px 0; }
+QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #272b34; }
 QLineEdit:focus, QSpinBox:focus { border-color: #4c7dff; }
 QCheckBox { spacing: 8px; color: #e6e8ee; }
 QCheckBox::indicator { width: 18px; height: 18px; border-radius: 5px;
@@ -848,6 +866,11 @@ class RegionPickerWindow(QWidget):
         self.banner = HudBanner(
             "영역 수정 중" if editing else "영역 추가 중",
             "드래그해서 범위를 지정하세요   ·   ESC 로 취소")
+
+    def set_prompt(self, title, subtitle):
+        self.banner.title = title
+        self.banner.subtitle = subtitle
+        self.banner.update()
 
     def _place_native(self):
         """Qt's logical<->native mapping is per-screen and origin-anchored, so
@@ -1354,6 +1377,25 @@ class SettingsDialog(QDialog):
         list_layout.addLayout(row)
         left_layout.addWidget(list_card, 1)
 
+        slot_card, slot_layout = make_card("빠른 추가 (퀵슬롯)")
+        self.slot_buttons = {}
+        slot_grid = QGridLayout()
+        slot_grid.setHorizontalSpacing(6)
+        slot_grid.setVerticalSpacing(6)
+        for index in range(SLOT_COUNT):
+            btn = QPushButton(f"F{index + 1}")
+            btn.setAutoDefault(False)
+            btn.clicked.connect(lambda _=False, i=index: self._quick_add(i))
+            self.slot_buttons[index] = btn
+            slot_grid.addWidget(btn, index // SLOT_COLUMNS, index % SLOT_COLUMNS)
+        slot_layout.addLayout(slot_grid)
+
+        self.lbl_slots = QLabel("")
+        self.lbl_slots.setObjectName("Caption")
+        self.lbl_slots.setWordWrap(True)
+        slot_layout.addWidget(self.lbl_slots)
+        left_layout.addWidget(slot_card)
+
         # App-wide options live here so they stay reachable with zero regions.
         global_card, global_layout = make_card("전체 설정")
         self.chk_follow = QCheckBox("대상 창을 따라 이동")
@@ -1585,7 +1627,7 @@ class SettingsDialog(QDialog):
             hover = int(self.controller.config.get("hover_opacity", 60))
             self.slider_hover.setValue(hover)
             self.lbl_hover.setText(f"{hover}%")
-            self.spin_refresh.setValue(int(self.controller.config.get("refresh_ms", 300)))
+            self.spin_refresh.setValue(int(self.controller.config.get("refresh_ms", 100)))
             self.hotkey_edit.set_value(self.controller.config.get("toggle_hotkey"))
         finally:
             self._loading -= 1
@@ -1626,6 +1668,7 @@ class SettingsDialog(QDialog):
             self.lbl_preset_res.setText(
                 "해상도가 지정되지 않았습니다. 영역을 처음 추가하면 그때의 "
                 "해상도가 기록됩니다.")
+        self._sync_slot_card()
 
     def reload_region_list(self):
         current = self._selected_id()
@@ -1949,6 +1992,25 @@ class SettingsDialog(QDialog):
         state = "숨김" if self.controller.pips_hidden else "표시 중"
         self.lbl_preset_state.setText(f"현재 사용 중: {name} ({state})")
 
+    def _quick_add(self, index):
+        if not self.controller.quick_add_slot(index, on_done=self.refresh):
+            QMessageBox.information(self, "안내",
+                                     f"{TARGET_LABEL} 이(가) 실행 중이 아닙니다.")
+
+    def _sync_slot_card(self):
+        connected = bool(self.controller.target_hwnd
+                          and user32.IsWindow(self.controller.target_hwnd))
+        editable = self.viewing_preset == self.controller.active_preset
+        for btn in self.slot_buttons.values():
+            btn.setEnabled(connected and editable)
+        if not editable:
+            self.lbl_slots.setText("사용 중인 프리셋에서만 추가할 수 있습니다.")
+        elif connected:
+            self.lbl_slots.setText(
+                "누르면 그 슬롯 한 칸이 PIP로 바로 추가됩니다.")
+        else:
+            self.lbl_slots.setText(f"{TARGET_LABEL} 실행 후 사용할 수 있습니다.")
+
     def _add(self):
         self.controller.begin_add_region(on_done=self.refresh)
 
@@ -1989,7 +2051,7 @@ class PipController(QObject):
 
         self.track_timer = QTimer()
         self.track_timer.timeout.connect(self.track_tick)
-        self.track_timer.start(int(self.config.get("refresh_ms", 300)))
+        self.track_timer.start(int(self.config.get("refresh_ms", 100)))
 
         # Position-follow needs to be much faster than the thumbnail refresh so
         # dragging the target window does not visibly lag the PIPs.
@@ -2168,6 +2230,43 @@ class PipController(QObject):
             if not self.regions_in_preset(i):
                 return i
         return None
+
+    def slot_rel(self, index):
+        """One quick slot as client-relative fractions. index 0..11 -> F1..F12,
+        laid out as the game shows them: F1-F6 upper row, F7-F12 below."""
+        if not self.target_hwnd or not user32.IsWindow(self.target_hwnd):
+            return None
+        cw, ch = client_size_of(self.target_hwnd)
+        if cw <= 0 or ch <= 0:
+            return None
+        col, row = index % SLOT_COLUMNS, index // SLOT_COLUMNS
+        x = SLOT_LEFT + col * SLOT_PITCH_X
+        y = ch - SLOT_BOTTOM + row * SLOT_PITCH_Y
+        return {"x": x / cw, "y": y / ch, "w": SLOT_SIZE / cw, "h": SLOT_SIZE / ch}
+
+    def quick_add_slot(self, index, on_done=None):
+        preset = self.active_preset
+        rel = self.slot_rel(index)
+        if not rel:
+            return None
+        name = f"F{index + 1}"
+        region = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "rel": rel,
+            "pip": self.default_pip_for(rel["w"], rel["h"], rel["x"], rel["y"]),
+        }
+        region.update(copy.deepcopy(DEFAULT_REGION_OPTS))
+        region["preset"] = preset
+        self.config["regions"].append(region)
+        save_config(self.config)
+        window = self.ensure_pip_window(region)
+        self.refresh_settings()
+        if window:
+            QTimer.singleShot(60, lambda: self.flash_pip(window, name))
+        if on_done:
+            on_done()
+        return region
 
     def regions_in_preset(self, preset):
         return [r for r in self.config["regions"] if r.get("preset") == preset]
