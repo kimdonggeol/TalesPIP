@@ -106,6 +106,8 @@ SLOT_PITCH_X = 27       # cell + separator
 SLOT_PITCH_Y = 40       # row + its F-key label strip
 SLOT_LEFT = 26          # F1's left edge, from the client's left
 SLOT_BOTTOM = 69        # top of the F1 row, measured up from the client's bottom
+SLOT_PIP_SCALE = 2      # quick-slot PIPs open at double size
+SLOT_PIP_OFFSET_X = 60  # right of the client's centre
 
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -2244,6 +2246,22 @@ class PipController(QObject):
         y = ch - SLOT_BOTTOM + row * SLOT_PITCH_Y
         return {"x": x / cw, "y": y / ch, "w": SLOT_SIZE / cw, "h": SLOT_SIZE / ch}
 
+    def slot_pip_geometry(self):
+        """Quick-slot PIPs open at double size, centred on the client and
+        nudged right, rather than on top of the slot bar they came from."""
+        pip = dict(DEFAULT_PIP)
+        if not self.target_hwnd or not user32.IsWindow(self.target_hwnd):
+            return pip
+        cw, ch = client_size_of(self.target_hwnd)
+        if cw <= 0 or ch <= 0:
+            return pip
+        dpr = QApplication.primaryScreen().devicePixelRatio() or 1.0
+        side = SLOT_SIZE * SLOT_PIP_SCALE
+        left = cw / 2 + SLOT_PIP_OFFSET_X - side / 2
+        top = ch / 2 - side / 2
+        return {"x": round(left / dpr), "y": round(top / dpr),
+                "w": round(side / dpr), "h": round(side / dpr)}
+
     def quick_add_slot(self, index, on_done=None):
         preset = self.active_preset
         rel = self.slot_rel(index)
@@ -2254,7 +2272,7 @@ class PipController(QObject):
             "id": str(uuid.uuid4()),
             "name": name,
             "rel": rel,
-            "pip": self.default_pip_for(rel["w"], rel["h"], rel["x"], rel["y"]),
+            "pip": self.slot_pip_geometry(),
         }
         region.update(copy.deepcopy(DEFAULT_REGION_OPTS))
         region["preset"] = preset
