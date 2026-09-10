@@ -68,4 +68,4 @@ pyinstaller --noconfirm --onefile --windowed --name TalesPIP tales_pip.py
 
 ## 라이선스
 
-미정 — 공개 배포 전에 선택해 주세요. (개인 도구라면 MIT가 무난합니다)
+[MIT](LICENSE)

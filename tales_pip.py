@@ -59,6 +59,7 @@ try:
     import json
     import copy
     import uuid
+    import winreg
     from ctypes import wintypes
 
     import psutil
@@ -68,7 +69,7 @@ try:
         QAbstractNativeEventFilter
     )
     from PyQt6.QtGui import (
-        QIcon, QAction, QPainter, QColor, QPen, QPixmap
+        QIcon, QAction, QPainter, QColor, QPen, QPixmap, QKeySequence
     )
     from PyQt6.QtWidgets import (
         QApplication, QWidget, QMenu, QMessageBox, QLabel,
@@ -85,11 +86,22 @@ TARGET_LABEL = "테일즈위버"  # shown in the UI instead of the process name
 DIALOG_CLASS = "#32770"  # standard Win32 dialog (patcher, message boxes)
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 PRESET_COUNT = 4
+
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+MOD_NOREPEAT = 0x4000
+WM_HOTKEY = 0x0312
+HOTKEY_ID = 0xA71C
+VK_F1 = 0x70
+DEFAULT_TOGGLE_HOTKEY = {"mods": MOD_CONTROL, "vk": 0x7B, "text": "Ctrl+F12"}
 DEFAULT_CONFIG = {
     "always_on_top": True,
     "refresh_ms": 300,
-    "preset_hotkeys": {"1": "Ctrl+F9", "2": "Ctrl+F10",
-                        "3": "Ctrl+F11", "4": "Ctrl+F12"},
+    # Presets follow the game's resolution automatically, so the only
+    # shortcut worth a global binding is show/hide.
+    "toggle_hotkey": dict(DEFAULT_TOGGLE_HOTKEY),
     # Remembered so the app can silently reattach when the target restarts.
     # A preset is a resolution profile: crop percentages only hold for the
     # client size they were drawn at, so each preset remembers its own.
@@ -110,12 +122,6 @@ DEFAULT_CONFIG = {
 }
 DEFAULT_REGION_OPTS = {"opacity": 100, "click_through": False, "preset": 1}
 # Hotkeys shipped as defaults by earlier versions, replaced on load.
-LEGACY_HOTKEY_DEFAULTS = {
-    "1": ("Alt+F1", "Ctrl+Alt+F1"),
-    "2": ("Alt+F2", "Ctrl+Alt+F2"),
-    "3": ("Alt+F3", "Ctrl+Alt+F3"),
-    "4": ("Alt+F5", "Ctrl+Alt+F4"),
-}
 
 user32 = ctypes.windll.user32
 dwmapi = ctypes.windll.dwmapi
@@ -193,44 +199,71 @@ def set_click_through(hwnd, enabled):
     _SetWindowLong(wintypes.HWND(hwnd), GWL_EXSTYLE, ctypes.c_longlong(ex))
 
 
-MOD_ALT = 0x0001
-MOD_CONTROL = 0x0002
-MOD_NOREPEAT = 0x4000
-WM_HOTKEY = 0x0312
-HOTKEY_ID_BASE = 0xA71C
-VK_F1 = 0x70
-HOTKEY_CHOICES = (["사용 안 함"]
-                   + [f"Ctrl+F{i}" for i in range(1, 13)]
-                   + [f"Ctrl+Alt+F{i}" for i in range(1, 13)])
+# Qt key -> Win32 virtual-key for keys whose codes do not already line up.
+QT_SPECIAL_VK = {
+    Qt.Key.Key_Space: 0x20, Qt.Key.Key_Tab: 0x09, Qt.Key.Key_Backspace: 0x08,
+    Qt.Key.Key_Return: 0x0D, Qt.Key.Key_Enter: 0x0D, Qt.Key.Key_Insert: 0x2D,
+    Qt.Key.Key_Delete: 0x2E, Qt.Key.Key_Home: 0x24, Qt.Key.Key_End: 0x23,
+    Qt.Key.Key_PageUp: 0x21, Qt.Key.Key_PageDown: 0x22, Qt.Key.Key_Left: 0x25,
+    Qt.Key.Key_Up: 0x26, Qt.Key.Key_Right: 0x27, Qt.Key.Key_Down: 0x28,
+    Qt.Key.Key_Print: 0x2C, Qt.Key.Key_Pause: 0x13,
+    Qt.Key.Key_QuoteLeft: 0xC0, Qt.Key.Key_Minus: 0xBD, Qt.Key.Key_Equal: 0xBB,
+    Qt.Key.Key_BracketLeft: 0xDB, Qt.Key.Key_BracketRight: 0xDD,
+    Qt.Key.Key_Backslash: 0xDC, Qt.Key.Key_Semicolon: 0xBA,
+    Qt.Key.Key_Apostrophe: 0xDE, Qt.Key.Key_Comma: 0xBC,
+    Qt.Key.Key_Period: 0xBE, Qt.Key.Key_Slash: 0xBF,
+}
+MODIFIER_KEYS = (Qt.Key.Key_Control, Qt.Key.Key_Alt, Qt.Key.Key_Shift,
+                  Qt.Key.Key_Meta, Qt.Key.Key_AltGr)
 
 
-def parse_hotkey(text):
-    """'Ctrl+Alt+F5' -> (mods|MOD_NOREPEAT, vk). Returns None when disabled."""
-    if not text or not isinstance(text, str):
-        return None
-    parts = [p for p in text.strip().lower().replace(" ", "").split("+") if p]
-    if not parts:
-        return None
-    key = parts[-1]
-    if not key.startswith("f"):
-        return None
-    try:
-        index = int(key[1:])
-    except ValueError:
-        return None
-    if not 1 <= index <= 12:
-        return None
+def qt_key_to_vk(key):
+    """Win32 virtual-key code for a Qt key, or None if unsupported."""
+    if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+        return int(key)          # Qt matches VK for A-Z
+    if Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+        return int(key)          # ... and for 0-9
+    if Qt.Key.Key_F1 <= key <= Qt.Key.Key_F24:
+        return VK_F1 + int(key) - int(Qt.Key.Key_F1)
+    return QT_SPECIAL_VK.get(key)
+
+
+def qt_modifiers_to_mods(modifiers):
     mods = 0
-    for part in parts[:-1]:
-        if part in ("ctrl", "control"):
-            mods |= MOD_CONTROL
-        elif part == "alt":
-            mods |= MOD_ALT
-        else:
-            return None
-    if not mods:
+    if modifiers & Qt.KeyboardModifier.ControlModifier:
+        mods |= MOD_CONTROL
+    if modifiers & Qt.KeyboardModifier.AltModifier:
+        mods |= MOD_ALT
+    if modifiers & Qt.KeyboardModifier.ShiftModifier:
+        mods |= MOD_SHIFT
+    if modifiers & Qt.KeyboardModifier.MetaModifier:
+        mods |= MOD_WIN
+    return mods
+
+
+def hotkey_text(mods, key):
+    parts = []
+    if mods & MOD_CONTROL:
+        parts.append("Ctrl")
+    if mods & MOD_ALT:
+        parts.append("Alt")
+    if mods & MOD_SHIFT:
+        parts.append("Shift")
+    if mods & MOD_WIN:
+        parts.append("Win")
+    parts.append(QKeySequence(key).toString() or "?")
+    return "+".join(parts)
+
+
+def normalize_hotkey(value):
+    """Accepts the stored dict and returns a valid one, or None when disabled."""
+    if not isinstance(value, dict):
         return None
-    return (mods | MOD_NOREPEAT, VK_F1 + index - 1)
+    mods, vk, text = value.get("mods"), value.get("vk"), value.get("text")
+    if not isinstance(mods, int) or not isinstance(vk, int) or not mods or not vk:
+        return None
+    return {"mods": mods, "vk": vk,
+            "text": text if isinstance(text, str) and text else "단축키"}
 
 
 class HotkeyFilter(QAbstractNativeEventFilter):
@@ -245,17 +278,15 @@ class HotkeyFilter(QAbstractNativeEventFilter):
         try:
             if event_type in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
                 msg = ctypes.cast(int(message), ctypes.POINTER(wintypes.MSG)).contents
-                if msg.message == WM_HOTKEY:
-                    preset = int(msg.wParam) - HOTKEY_ID_BASE
-                    if 1 <= preset <= PRESET_COUNT:
-                        # Qt runs this filter twice per message (dispatcher +
-                        # wndproc), which would toggle twice and cancel itself
-                        # out. Drop the duplicate, and consume the event.
-                        stamp = (msg.time, msg.lParam, msg.wParam)
-                        if stamp != self._last:
-                            self._last = stamp
-                            self.callback(preset)
-                        return True, 0
+                if msg.message == WM_HOTKEY and int(msg.wParam) == HOTKEY_ID:
+                    # Qt runs this filter twice per message (dispatcher +
+                    # wndproc), which would toggle twice and cancel itself
+                    # out. Drop the duplicate, and consume the event.
+                    stamp = (msg.time, msg.lParam, msg.wParam)
+                    if stamp != self._last:
+                        self._last = stamp
+                        self.callback()
+                    return True, 0
         except Exception:
             log_exception(dialog=False)
         return False, 0
@@ -280,6 +311,49 @@ def client_size_of(hwnd):
 
 
 DEFAULT_PIP = {"x": 100, "y": 100, "w": 320, "h": 240}
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+APP_NAME = "TalesPIP"
+
+
+def startup_command():
+    """Command Windows should run at logon — the exe when frozen, otherwise
+    pythonw (no console window) plus this script."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    launcher = pythonw if os.path.exists(pythonw) else sys.executable
+    return f'"{launcher}" "{os.path.abspath(__file__)}"'
+
+
+def is_startup_enabled():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            winreg.QueryValueEx(key, APP_NAME)
+            return True
+    except OSError:
+        return False
+
+
+def set_startup_enabled(enabled):
+    """Returns True on success. Writes only under HKEY_CURRENT_USER, so no
+    administrator rights are needed."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                             winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                # Always rewrite: the exe may have been moved since last time.
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, startup_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, APP_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except OSError:
+        log_exception(dialog=False)
+        return False
 
 
 def load_config():
@@ -348,22 +422,7 @@ def load_config():
     active = config.get("active_preset")
     config["active_preset"] = active if isinstance(active, int) and 1 <= active <= PRESET_COUNT else 1
 
-    raw_keys = config.get("preset_hotkeys")
-    keys = {}
-    for i in range(1, PRESET_COUNT + 1):
-        value = (raw_keys or {}).get(str(i)) if isinstance(raw_keys, dict) else None
-        default = DEFAULT_CONFIG["preset_hotkeys"][str(i)]
-        # Values that were merely an older release's default are not deliberate
-        # user choices, so move them to the current default instead of keeping them.
-        if not isinstance(value, str) or not value or value in LEGACY_HOTKEY_DEFAULTS[str(i)]:
-            keys[str(i)] = default
-        elif value in HOTKEY_CHOICES:
-            keys[str(i)] = value
-        else:
-            parsed = parse_hotkey(value)
-            upgraded = f"Ctrl+F{parsed[1] - VK_F1 + 1}" if parsed else None
-            keys[str(i)] = upgraded if upgraded in HOTKEY_CHOICES else default
-    config["preset_hotkeys"] = keys
+    config["toggle_hotkey"] = normalize_hotkey(config.get("toggle_hotkey"))
     # Always-on-top is not user-configurable; a PIP that can hide behind the
     # game window is useless.
     config["always_on_top"] = True
@@ -1058,6 +1117,64 @@ class PipWindow(QWidget):
                 0, lambda: self.click_through_toggled.emit(self.region["id"], enabled))
 
 
+class HotkeyEdit(QPushButton):
+    """Click, then press a combination. Emits the hotkey dict, or nothing if
+    the user cancels with Escape."""
+
+    captured = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.value = None
+        self._capturing = False
+        self.setAutoDefault(False)
+        self.clicked.connect(self._begin)
+
+    def set_value(self, value):
+        self.value = value
+        self._refresh_text()
+
+    def _refresh_text(self):
+        self.setText(self.value["text"] if self.value else "단축키 없음")
+
+    def _begin(self):
+        self._capturing = True
+        self.setText("조합을 누르세요…  (Esc 취소)")
+        self.grabKeyboard()
+
+    def _end(self):
+        self._capturing = False
+        self.releaseKeyboard()
+
+    def keyPressEvent(self, e):
+        if not self._capturing:
+            super().keyPressEvent(e)
+            return
+        key = e.key()
+        if key in MODIFIER_KEYS:
+            return                        # wait for the non-modifier key
+        if key == Qt.Key.Key_Escape:
+            self._end()
+            self._refresh_text()
+            return
+        mods = qt_modifiers_to_mods(e.modifiers())
+        vk = qt_key_to_vk(key)
+        if not mods:
+            self.setText("Ctrl / Alt / Shift 와 함께 눌러주세요")
+            return
+        if vk is None:
+            self.setText("지원하지 않는 키입니다")
+            return
+        self._end()
+        self.captured.emit({"mods": mods, "vk": vk, "text": hotkey_text(mods, key)})
+
+    def focusOutEvent(self, e):
+        if self._capturing:
+            self._end()
+            self._refresh_text()
+        super().focusOutEvent(e)
+
+
 class SettingsDialog(QDialog):
     def __init__(self, controller, parent=None):
         super().__init__(parent)
@@ -1149,6 +1266,8 @@ class SettingsDialog(QDialog):
         self.chk_follow.toggled.connect(self._commit_follow)
         self.chk_active = QCheckBox("게임이 활성 창일 때만 표시")
         self.chk_active.toggled.connect(self._commit_only_when_active)
+        self.chk_startup = QCheckBox("윈도우 시작 시 자동 실행")
+        self.chk_startup.toggled.connect(self._commit_startup)
         self.chk_notify = QCheckBox("트레이 알림 표시")
         self.chk_notify.toggled.connect(self._commit_notifications)
         self.chk_hover = QCheckBox("커서가 올라간 마우스 통과 PIP는 흐리게")
@@ -1171,6 +1290,7 @@ class SettingsDialog(QDialog):
         refresh_row.addStretch()
         global_layout.addWidget(self.chk_follow)
         global_layout.addWidget(self.chk_active)
+        global_layout.addWidget(self.chk_startup)
         global_layout.addWidget(self.chk_notify)
         global_layout.addWidget(self.chk_hover)
         global_layout.addLayout(hover_row)
@@ -1178,22 +1298,16 @@ class SettingsDialog(QDialog):
 
         left_layout.addWidget(global_card)
 
-        hotkey_card, hotkey_layout = make_card("프리셋 단축키")
-        self.combo_hotkeys = {}
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(6)
-        for preset in range(1, PRESET_COUNT + 1):
-            combo = QComboBox()
-            combo.addItems(HOTKEY_CHOICES)
-            combo.currentTextChanged.connect(
-                lambda text, p=preset: self._commit_hotkey(p, text))
-            self.combo_hotkeys[preset] = combo
-            grid.addWidget(QLabel(f"프리셋 {preset}"), preset - 1, 0)
-            grid.addWidget(combo, preset - 1, 1)
-        hotkey_layout.addLayout(grid)
-        hint = QLabel("단축키를 누르면 해당 프리셋으로 전환됩니다. "
-                       "현재 프리셋의 키를 다시 누르면 PIP가 숨겨집니다.")
+        hotkey_card, hotkey_layout = make_card("단축키")
+        self.hotkey_edit = HotkeyEdit()
+        self.hotkey_edit.captured.connect(self._commit_hotkey)
+        hotkey_layout.addWidget(QLabel("PIP 표시 / 숨김"))
+        hotkey_layout.addWidget(self.hotkey_edit)
+        btn_clear_hotkey = QPushButton("단축키 해제")
+        btn_clear_hotkey.clicked.connect(lambda: self._commit_hotkey(None))
+        hotkey_layout.addWidget(btn_clear_hotkey)
+        hint = QLabel("버튼을 누른 뒤 원하는 조합을 입력하세요. "
+                       "게임 중에도 동작하며, 프리셋은 해상도에 따라 자동 전환됩니다.")
         hint.setObjectName("Caption")
         hint.setWordWrap(True)
         hotkey_layout.addWidget(hint)
@@ -1377,18 +1491,15 @@ class SettingsDialog(QDialog):
         try:
             self.chk_follow.setChecked(bool(self.controller.config.get("follow_target", True)))
             self.chk_active.setChecked(bool(self.controller.config.get("only_when_active", True)))
+            # The registry is the source of truth, not config.json.
+            self.chk_startup.setChecked(is_startup_enabled())
             self.chk_notify.setChecked(bool(self.controller.config.get("notifications", True)))
             self.chk_hover.setChecked(bool(self.controller.config.get("dim_on_hover", True)))
             hover = int(self.controller.config.get("hover_opacity", 60))
             self.slider_hover.setValue(hover)
             self.lbl_hover.setText(f"{hover}%")
             self.spin_refresh.setValue(int(self.controller.config.get("refresh_ms", 300)))
-            keys = self.controller.config["preset_hotkeys"]
-            for preset, combo in self.combo_hotkeys.items():
-                value = keys.get(str(preset)) or HOTKEY_CHOICES[0]
-                if value not in HOTKEY_CHOICES:
-                    value = HOTKEY_CHOICES[0]
-                combo.setCurrentText(value)
+            self.hotkey_edit.set_value(self.controller.config.get("toggle_hotkey"))
         finally:
             self._loading -= 1
         self._loading += 1
@@ -1669,6 +1780,18 @@ class SettingsDialog(QDialog):
         save_config(self.controller.config)
         self.controller.sync_active_state()
 
+    def _commit_startup(self, checked):
+        if self._loading:
+            return
+        if set_startup_enabled(checked):
+            return
+        QMessageBox.warning(self, "안내", "시작 프로그램 등록에 실패했습니다.")
+        self._loading += 1
+        try:
+            self.chk_startup.setChecked(not checked)
+        finally:
+            self._loading -= 1
+
     def _commit_notifications(self, checked):
         if self._loading:
             return
@@ -1764,40 +1887,23 @@ class SettingsDialog(QDialog):
         self.controller.apply_visibility()
         self.refresh()
 
-    def _commit_hotkey(self, preset, text):
+    def _commit_hotkey(self, hotkey):
         if self._loading:
             return
-        keys = self.controller.config["preset_hotkeys"]
-        previous = keys.get(str(preset))
-        new_value = "" if text == HOTKEY_CHOICES[0] else text
-
-        clash = next((p for p in range(1, PRESET_COUNT + 1)
-                       if p != preset and new_value and keys.get(str(p)) == new_value), None)
-        if clash:
-            self._revert_hotkey(preset, previous)
-            QMessageBox.warning(self, "단축키 중복",
-                                 f"{text} 은(는) 이미 프리셋 {clash} 에 지정되어 있습니다.")
-            return
-
-        keys[str(preset)] = new_value
-        failed = self.controller.register_hotkeys()
-        if preset in failed:
-            keys[str(preset)] = previous
-            self.controller.register_hotkeys()
-            self._revert_hotkey(preset, previous)
-            QMessageBox.warning(self, "단축키 사용 불가",
-                                 f"{text} 은(는) 다른 프로그램이 사용 중입니다.\n"
-                                 "다른 조합을 선택하세요.")
+        previous = self.controller.config.get("toggle_hotkey")
+        self.controller.config["toggle_hotkey"] = normalize_hotkey(hotkey)
+        if not self.controller.register_hotkey():
+            self.controller.config["toggle_hotkey"] = previous
+            self.controller.register_hotkey()
+            self.hotkey_edit.set_value(previous)
+            QMessageBox.warning(
+                self, "단축키 사용 불가",
+                f"{hotkey['text']} 은(는) 다른 프로그램이 사용 중입니다.\n"
+                "다른 조합을 눌러보세요.")
             return
         save_config(self.controller.config)
+        self.hotkey_edit.set_value(self.controller.config["toggle_hotkey"])
         self.update_preset_state()
-
-    def _revert_hotkey(self, preset, previous):
-        self._loading += 1
-        try:
-            self.combo_hotkeys[preset].setCurrentText(previous or HOTKEY_CHOICES[0])
-        finally:
-            self._loading -= 1
 
     def update_preset_state(self):
         name = self.controller.preset_name(self.controller.active_preset)
@@ -1834,8 +1940,8 @@ class PipController(QObject):
         self.pips_hidden = False
         self._hotkey_hwnd = None
         self._hotkey_holder = None
-        self._registered_presets = []
-        self._hotkey_filter = HotkeyFilter(self.activate_preset)
+        self._hotkey_registered = False
+        self._hotkey_filter = HotkeyFilter(self.toggle_hidden)
         QApplication.instance().installNativeEventFilter(self._hotkey_filter)
 
         self.process_timer = QTimer()
@@ -1907,54 +2013,47 @@ class PipController(QObject):
         QTimer.singleShot(0, self.check_process)
         self.update_tray_tooltip()
 
-        failed = self.register_hotkeys()
-        if failed:
-            names = ", ".join(
-                f"프리셋 {p}({self.config['preset_hotkeys'].get(str(p))})" for p in failed)
+        if not self.register_hotkey():
             self.notify(
                 "단축키 등록 실패",
-                f"{names} 은(는) 다른 프로그램이 사용 중입니다.\n설정에서 변경하세요.",
+                f"{self.hotkey_text()} 은(는) 다른 프로그램이 사용 중입니다.\n"
+                "설정에서 다른 조합으로 바꾸세요.",
                 QSystemTrayIcon.MessageIcon.Warning, 5000)
 
-    def register_hotkeys(self):
-        """(Re)binds every preset hotkey. Returns the list of presets that failed."""
-        self.unregister_hotkeys()
+    def hotkey_text(self):
+        hotkey = self.config.get("toggle_hotkey")
+        return hotkey["text"] if hotkey else "없음"
+
+    def register_hotkey(self):
+        """(Re)binds the global show/hide hotkey. True when nothing failed."""
+        self.unregister_hotkey()
+        hotkey = self.config.get("toggle_hotkey")
+        if not hotkey:
+            return True
         if self._hotkey_holder is None:
-            # A hidden window owns the hotkeys; the tray icon has no HWND.
+            # A hidden window owns the hotkey; the tray icon has no HWND.
             self._hotkey_holder = QWidget()
             self._hotkey_holder.setWindowFlags(Qt.WindowType.Tool)
             self._hotkey_holder.resize(1, 1)
-        hwnd = int(self._hotkey_holder.winId())
-        self._hotkey_hwnd = hwnd
-        failed = []
-        for preset in range(1, PRESET_COUNT + 1):
-            combo = parse_hotkey(self.config["preset_hotkeys"].get(str(preset)))
-            if not combo:
-                continue
-            mods, vk = combo
-            if user32.RegisterHotKey(wintypes.HWND(hwnd), HOTKEY_ID_BASE + preset, mods, vk):
-                self._registered_presets.append(preset)
-            else:
-                failed.append(preset)
-        return failed
+        self._hotkey_hwnd = int(self._hotkey_holder.winId())
+        if user32.RegisterHotKey(wintypes.HWND(self._hotkey_hwnd), HOTKEY_ID,
+                                  hotkey["mods"] | MOD_NOREPEAT, hotkey["vk"]):
+            self._hotkey_registered = True
+            return True
+        return False
 
-    def unregister_hotkeys(self):
-        if self._hotkey_hwnd:
-            for preset in self._registered_presets:
-                user32.UnregisterHotKey(wintypes.HWND(self._hotkey_hwnd),
-                                         HOTKEY_ID_BASE + preset)
-        self._registered_presets = []
+    def unregister_hotkey(self):
+        if self._hotkey_hwnd and self._hotkey_registered:
+            user32.UnregisterHotKey(wintypes.HWND(self._hotkey_hwnd), HOTKEY_ID)
+        self._hotkey_registered = False
 
     def activate_preset(self, preset, from_auto=False):
-        """Switch to a preset. Re-pressing the active one toggles the PIPs off."""
+        """Switch to a preset. Showing/hiding is a separate action now."""
         try:
-            if preset == self.active_preset and not from_auto:
-                self.pips_hidden = not self.pips_hidden
-            else:
-                self.active_preset = preset
-                self.pips_hidden = False
-                self.config["active_preset"] = preset
-                save_config(self.config)
+            self.active_preset = preset
+            self.pips_hidden = False
+            self.config["active_preset"] = preset
+            save_config(self.config)
             self.apply_visibility()
             self.update_tray_tooltip()
             if self.settings_dialog and self.settings_dialog.isVisible():
