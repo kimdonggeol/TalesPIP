@@ -65,12 +65,12 @@ try:
     import psutil
 
     from PyQt6.QtCore import (
-        Qt, QObject, QTimer, QRect, QRectF, QSize, QPoint, pyqtSignal,
+        Qt, QObject, QTimer, QRect, QRectF, QSize, QPoint, QPointF, pyqtSignal,
         QAbstractNativeEventFilter
     )
     from PyQt6.QtGui import (
         QIcon, QAction, QPainter, QColor, QPen, QPixmap, QKeySequence,
-        QLinearGradient
+        QLinearGradient, QPainterPath, QFont, QTransform
     )
     from PyQt6.QtWidgets import (
         QApplication, QWidget, QMenu, QMessageBox, QLabel,
@@ -557,32 +557,88 @@ QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 QSS = QSS.replace("#3d4椒a", "#3d434f")
 
 
+ICON_JELLY_HI = QColor(150, 196, 255)
+ICON_JELLY_LO = QColor(70, 116, 226)
+ICON_OUTLINE = QColor(28, 58, 130)
+ICON_SCREEN = QColor(20, 38, 92)
+ICON_TEXT = QColor(255, 251, 240)
+
+
+def _jelly_blob(rect):
+    """Squishy silhouette — rounder on top, settling to one side at the bottom."""
+    x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+    path = QPainterPath(QPointF(x + w * 0.5, y))
+    path.cubicTo(QPointF(x + w * 0.95, y), QPointF(x + w, y + h * 0.18),
+                  QPointF(x + w, y + h * 0.55))
+    path.cubicTo(QPointF(x + w, y + h * 0.88), QPointF(x + w * 0.80, y + h),
+                  QPointF(x + w * 0.55, y + h))
+    path.cubicTo(QPointF(x + w * 0.34, y + h), QPointF(x + w * 0.14, y + h * 0.94),
+                  QPointF(x, y + h * 0.66))
+    path.cubicTo(QPointF(x - w * 0.02, y + h * 0.30), QPointF(x + w * 0.12, y),
+                  QPointF(x + w * 0.5, y))
+    path.closeSubpath()
+    return path
+
+
+def _tw_path(rect):
+    font = QFont("Segoe UI", 100)
+    font.setWeight(QFont.Weight.Black)
+    probe = QPainterPath()
+    probe.addText(0, 0, font, "TW")
+    box = probe.boundingRect()
+    if box.width() <= 0 or box.height() <= 0:
+        return probe
+    scale = min(rect.width() / box.width(), rect.height() / box.height())
+    transform = QTransform()
+    transform.translate(rect.center().x(), rect.center().y())
+    transform.scale(scale, scale)
+    transform.translate(-box.center().x(), -box.center().y())
+    return transform.map(probe)
+
+
 def icon_pixmap(size):
-    """The PIP glyph: a screen with a smaller inset panel. Drawn in code so
-    there is no external asset to ship or lose."""
-    scale = size / 64.0
+    """A jelly bead bezel around a screen showing TW. Drawn in code so there is
+    no external asset to ship, and rendered per size so it survives 16px."""
+    s = float(size)
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    p = QPainter(pixmap)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-    gradient = QLinearGradient(0, 0, 0, size)
-    gradient.setColorAt(0.0, QColor(96, 141, 255))
-    gradient.setColorAt(1.0, QColor(59, 96, 214))
-    painter.setBrush(gradient)
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.drawRoundedRect(QRectF(3 * scale, 8 * scale, 58 * scale, 48 * scale),
-                             11 * scale, 11 * scale)
+    blob = _jelly_blob(QRectF(s * 0.06, s * 0.08, s * 0.88, s * 0.84))
+    gradient = QLinearGradient(0, s * 0.08, 0, s * 0.92)
+    gradient.setColorAt(0.0, ICON_JELLY_HI)
+    gradient.setColorAt(0.55, ICON_JELLY_LO)
+    gradient.setColorAt(1.0, QColor(40, 86, 196))
+    p.setPen(QPen(ICON_OUTLINE, s * 0.055, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    p.setBrush(gradient)
+    p.drawPath(blob)
 
-    # Screen area, darkened so the inset panel reads at small sizes.
-    painter.setBrush(QColor(23, 30, 54, 150))
-    painter.drawRoundedRect(QRectF(9 * scale, 14 * scale, 46 * scale, 36 * scale),
-                             6 * scale, 6 * scale)
+    # Glossy top, clipped to the blob so it reads as a wet surface.
+    p.save()
+    p.setClipPath(blob)
+    shine = QLinearGradient(0, s * 0.08, 0, s * 0.50)
+    shine.setColorAt(0.0, QColor(255, 255, 255, 165))
+    shine.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(shine)
+    p.drawRoundedRect(QRectF(s * 0.06, s * 0.08, s * 0.88, s * 0.40),
+                       s * 0.05, s * 0.05)
+    p.restore()
 
-    painter.setBrush(QColor(255, 255, 255))
-    painter.drawRoundedRect(QRectF(31 * scale, 28 * scale, 21 * scale, 18 * scale),
-                             4 * scale, 4 * scale)
-    painter.end()
+    p.setPen(QPen(ICON_OUTLINE, s * 0.04))
+    p.setBrush(ICON_SCREEN)
+    p.drawRoundedRect(QRectF(s * 0.20, s * 0.26, s * 0.60, s * 0.44),
+                       s * 0.09, s * 0.09)
+
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(ICON_TEXT)
+    p.drawPath(_tw_path(QRectF(s * 0.26, s * 0.36, s * 0.48, s * 0.22)))
+
+    p.setBrush(QColor(255, 255, 255, 210))
+    p.drawEllipse(QRectF(s * 0.20, s * 0.14, s * 0.16, s * 0.09))
+    p.end()
     return pixmap
 
 
