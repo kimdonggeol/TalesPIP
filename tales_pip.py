@@ -1,6 +1,7 @@
 import sys
 import os
 import math
+import threading
 import traceback
 import ctypes
 
@@ -69,6 +70,8 @@ try:
     import copy
     import uuid
     import winreg
+    import urllib.request
+    import webbrowser
     from ctypes import wintypes
 
     import psutil
@@ -93,6 +96,12 @@ except Exception:
 
 TARGET_PROCESS = "InphaseNXD.exe"
 TARGET_LABEL = "테일즈위버"  # shown in the UI instead of the process name
+
+APP_VERSION = "1.0.2"
+APP_AUTHOR = "하이아칸 · 김동걸"
+REPO_URL = "https://github.com/kimdonggeol/TalesPIP"
+LATEST_RELEASE_API = "https://api.github.com/repos/kimdonggeol/TalesPIP/releases/latest"
+RELEASES_URL = REPO_URL + "/releases/latest"
 DIALOG_CLASS = "#32770"  # standard Win32 dialog (patcher, message boxes)
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 PRESET_COUNT = 4
@@ -138,6 +147,7 @@ DEFAULT_CONFIG = {
     "follow_target": True,
     "only_when_active": True,
     # pip x/y are offsets from the target's client origin, not screen coords.
+    "check_updates": True,
     "pip_coords": "relative",
     "regions": [],
 }
@@ -332,6 +342,43 @@ def client_size_of(hwnd):
 
 
 DEFAULT_PIP = {"x": 100, "y": 100, "w": 320, "h": 240}
+
+
+def parse_version(text):
+    """'v1.2.3' -> (1, 2, 3); unparsable parts become 0 so a odd tag never
+    reads as newer than everything."""
+    digits = []
+    for part in str(text).lstrip("vV").split(".")[:4]:
+        number = "".join(c for c in part if c.isdigit())
+        digits.append(int(number) if number else 0)
+    return tuple(digits) or (0,)
+
+
+def fetch_latest_version(timeout=6):
+    """Latest release tag on GitHub, or None. Network problems are not worth
+    bothering the user about, so failures are silent."""
+    try:
+        request = urllib.request.Request(
+            LATEST_RELEASE_API,
+            headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}",
+                      "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.load(response).get("tag_name")
+    except Exception:
+        return None
+
+
+class UpdateCheck(QObject):
+    """Runs the version check off the UI thread; a slow network must never
+    hold up startup."""
+    finished = pyqtSignal(object)      # latest tag, or None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        self.finished.emit(fetch_latest_version())
 
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -531,6 +578,10 @@ QScrollArea { background: transparent; border: none; }
 QScrollArea#Root > QWidget > QWidget { background: #16181d; }
 QScrollArea#SidePanel > QWidget > QWidget { background: #0f1116; }
 QLabel#PanelTitle { font-size: 14px; font-weight: 600; color: #aab2c5; }
+QLabel#UpdateBadge {
+    background: #1d2a44; border: 1px solid #2f4a8f; border-radius: 8px;
+    padding: 8px 10px; color: #cfe0ff;
+}
 QWidget#SidePanel QFrame#Card { background: #171a21; border-color: #242936; }
 QLabel { color: #e6e8ee; background: transparent; }
 QLabel#Title { font-size: 20px; font-weight: 600; }
@@ -1335,12 +1386,20 @@ class SettingsDialog(QDialog):
         left_layout.setContentsMargins(18, 18, 12, 18)
         left_layout.setSpacing(12)
 
-        title = QLabel("TalesPIP")
+        title = QLabel(f"TalesPIP <span style='font-size:12px; color:#7d8698;'>"
+                        f"v{APP_VERSION}</span>")
         title.setObjectName("Title")
-        subtitle = QLabel("프리셋과 PIP 목록 · 전역 설정")
+        subtitle = QLabel(f"만든이 {APP_AUTHOR}")
         subtitle.setObjectName("Caption")
         left_layout.addWidget(title)
         left_layout.addWidget(subtitle)
+
+        self.lbl_update = QLabel("")
+        self.lbl_update.setObjectName("UpdateBadge")
+        self.lbl_update.setWordWrap(True)
+        self.lbl_update.setOpenExternalLinks(True)
+        self.lbl_update.hide()
+        left_layout.addWidget(self.lbl_update)
 
         target_card, target_layout = make_card("대상 프로그램")
         self.lbl_status = QLabel("-")
@@ -1411,6 +1470,8 @@ class SettingsDialog(QDialog):
         self.chk_active.toggled.connect(self._commit_only_when_active)
         self.chk_startup = QCheckBox("윈도우 시작 시 자동 실행")
         self.chk_startup.toggled.connect(self._commit_startup)
+        self.chk_updates = QCheckBox("시작할 때 업데이트 확인")
+        self.chk_updates.toggled.connect(self._commit_check_updates)
         self.chk_notify = QCheckBox("트레이 알림 표시")
         self.chk_notify.toggled.connect(self._commit_notifications)
         self.chk_hover = QCheckBox("커서가 올라간 마우스 통과 PIP는 흐리게")
@@ -1434,6 +1495,7 @@ class SettingsDialog(QDialog):
         global_layout.addWidget(self.chk_follow)
         global_layout.addWidget(self.chk_active)
         global_layout.addWidget(self.chk_startup)
+        global_layout.addWidget(self.chk_updates)
         global_layout.addWidget(self.chk_notify)
         global_layout.addWidget(self.chk_hover)
         global_layout.addLayout(hover_row)
@@ -1629,6 +1691,7 @@ class SettingsDialog(QDialog):
             self.chk_active.setChecked(bool(self.controller.config.get("only_when_active", True)))
             # The registry is the source of truth, not config.json.
             self.chk_startup.setChecked(is_startup_enabled())
+            self.chk_updates.setChecked(bool(self.controller.config.get("check_updates", True)))
             self.chk_notify.setChecked(bool(self.controller.config.get("notifications", True)))
             self.chk_hover.setChecked(bool(self.controller.config.get("dim_on_hover", True)))
             hover = int(self.controller.config.get("hover_opacity", 60))
@@ -1647,6 +1710,8 @@ class SettingsDialog(QDialog):
             self.combo_preset.setCurrentIndex(max(0, index))
         finally:
             self._loading -= 1
+        if self.controller.latest_version:
+            self.show_update(self.controller.latest_version)
         self._load_preset_fields()
         self.update_preset_state()
         self.reload_region_list()
@@ -1921,6 +1986,18 @@ class SettingsDialog(QDialog):
         finally:
             self._loading -= 1
 
+    def show_update(self, tag):
+        self.lbl_update.setText(
+            f"새 버전 {tag} 이(가) 나왔습니다 &nbsp;"
+            f"<a href='{RELEASES_URL}' style='color:#8fb4ff;'>다운로드</a>")
+        self.lbl_update.show()
+
+    def _commit_check_updates(self, checked):
+        if self._loading:
+            return
+        self.controller.config["check_updates"] = checked
+        save_config(self.controller.config)
+
     def _commit_notifications(self, checked):
         if self._loading:
             return
@@ -2039,6 +2116,8 @@ class PipController(QObject):
         self.target_hwnd = None
         self.pip_windows = {}
         self.picker = None
+        self._update_check = None
+        self.latest_version = None
         self.target_active = True
         self._flashes = []
         self.settings_dialog = None
@@ -2104,6 +2183,9 @@ class PipController(QObject):
         act_add = QAction("영역 추가", menu)
         act_add.triggered.connect(lambda: self.begin_add_region())
         menu.addAction(act_add)
+        act_update = QAction("업데이트 확인", menu)
+        act_update.triggered.connect(lambda: self.check_for_updates(manual=True))
+        menu.addAction(act_update)
         menu.addSeparator()
         act_quit = QAction("종료", menu)
         act_quit.triggered.connect(QApplication.quit)
@@ -2132,6 +2214,7 @@ class PipController(QObject):
         if not QSystemTrayIcon.isSystemTrayAvailable() or first_run:
             QTimer.singleShot(0, self.open_settings)
         QTimer.singleShot(0, self.check_process)
+        QTimer.singleShot(2500, self.check_for_updates)
         self.update_tray_tooltip()
 
         if not self.register_hotkey():
@@ -2179,6 +2262,47 @@ class PipController(QObject):
             self.update_tray_tooltip()
             if self.settings_dialog and self.settings_dialog.isVisible():
                 self.settings_dialog.on_active_preset_changed()
+        except Exception:
+            log_exception(dialog=False)
+
+    def check_for_updates(self, manual=False):
+        """manual=True comes from the tray menu, so it reports 'up to date' and
+        network failures too; the startup check stays silent."""
+        if self._update_check is not None:
+            return
+        if not manual and not self.config.get("check_updates", True):
+            return
+        checker = UpdateCheck()
+        checker.finished.connect(lambda tag: self._on_update_checked(tag, manual))
+        self._update_check = checker
+        checker.start()
+
+    def _on_update_checked(self, tag, manual):
+        self._update_check = None
+        if tag and parse_version(tag) > parse_version(APP_VERSION):
+            self.latest_version = tag
+            if self.settings_dialog:
+                self.settings_dialog.show_update(tag)
+            self.tray.showMessage(
+                "새 버전이 있습니다",
+                f"{tag} 이(가) 나왔습니다. 트레이 메뉴 > 업데이트 확인에서 받으세요.",
+                QSystemTrayIcon.MessageIcon.Information, 6000)
+            if manual:
+                self.open_releases_page()
+            return
+        if not manual:
+            return
+        if tag is None:
+            QMessageBox.information(None, "업데이트 확인",
+                                     "업데이트 정보를 가져오지 못했습니다.\n"
+                                     "네트워크 상태를 확인해 주세요.")
+        else:
+            QMessageBox.information(None, "업데이트 확인",
+                                     f"최신 버전을 사용 중입니다. (v{APP_VERSION})")
+
+    def open_releases_page(self):
+        try:
+            webbrowser.open(RELEASES_URL)
         except Exception:
             log_exception(dialog=False)
 
