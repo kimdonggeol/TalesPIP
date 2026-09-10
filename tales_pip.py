@@ -559,14 +559,10 @@ QLineEdit, QSpinBox {
     background: #1a1d23; border: 1px solid #2a2f3a; border-radius: 7px;
     padding: 6px 8px; color: #e6e8ee; selection-background-color: #4c7dff;
 }
-/* Reserve the arrows' width, or long values run underneath them. */
+/* Reserve room for the arrows so long values do not run underneath them.
+   Only padding: styling the buttons themselves makes Qt stop drawing the
+   arrow indicators altogether. */
 QSpinBox { padding-right: 26px; }
-QSpinBox::up-button, QSpinBox::down-button {
-    subcontrol-origin: border; width: 22px; border: none; background: transparent;
-}
-QSpinBox::up-button { subcontrol-position: top right; margin: 2px 2px 0 0; }
-QSpinBox::down-button { subcontrol-position: bottom right; margin: 0 2px 2px 0; }
-QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #272b34; }
 QLineEdit:focus, QSpinBox:focus { border-color: #4c7dff; }
 QCheckBox { spacing: 8px; color: #e6e8ee; }
 QCheckBox::indicator { width: 18px; height: 18px; border-radius: 5px;
@@ -578,10 +574,19 @@ QSlider::handle:horizontal {
     background: #ffffff; width: 16px; height: 16px;
     margin: -6px 0; border-radius: 8px;
 }
-QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
-QScrollBar::handle:vertical { background: #333945; border-radius: 5px; min-height: 30px; }
-QScrollBar::handle:vertical:hover { background: #3f4655; }
-QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
+/* A recessed track behind a lighter, fully rounded handle — without the track
+   the handle had nothing to read against on these dark panels. */
+QScrollBar:vertical {
+    background: #12141a; width: 14px; margin: 2px; border-radius: 7px;
+}
+QScrollBar::handle:vertical {
+    background: #49505f; border-radius: 5px; min-height: 36px;
+    margin: 2px; border: 1px solid rgba(120, 130, 150, 0.35);
+}
+QScrollBar::handle:vertical:hover { background: #5d6577; }
+QScrollBar::handle:vertical:pressed { background: #6f778a; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
 """
 QSS = QSS.replace("#3d4椒a", "#3d434f")
 
@@ -1318,7 +1323,7 @@ class SettingsDialog(QDialog):
         self.preview_timer.timeout.connect(self.update_preview)
         self.setWindowTitle("TalesPIP")
         self.setStyleSheet(QSS)
-        self.resize(880, 780)
+        self.resize(910, 780)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1459,7 +1464,7 @@ class SettingsDialog(QDialog):
         left_scroll.setObjectName("Root")
         left_scroll.setWidget(left)
         left_scroll.setWidgetResizable(True)
-        left_scroll.setFixedWidth(364)
+        left_scroll.setFixedWidth(392)
         left_scroll.setFrameShape(QFrame.Shape.NoFrame)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         root.addWidget(left_scroll)
@@ -2111,6 +2116,9 @@ class PipController(QObject):
         if first_run:
             # Run at logon by default; the checkbox in settings turns it off.
             set_startup_enabled(True)
+            # Write the file straight away rather than waiting for the first
+            # change, so it is obvious where settings live.
+            save_config(self.config)
 
         # The tray icon is the only always-available entry point; if it is
         # unavailable (or hidden in the overflow area on first run) the user
