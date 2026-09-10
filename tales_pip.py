@@ -65,11 +65,12 @@ try:
     import psutil
 
     from PyQt6.QtCore import (
-        Qt, QObject, QTimer, QRect, QSize, QPoint, pyqtSignal,
+        Qt, QObject, QTimer, QRect, QRectF, QSize, QPoint, pyqtSignal,
         QAbstractNativeEventFilter
     )
     from PyQt6.QtGui import (
-        QIcon, QAction, QPainter, QColor, QPen, QPixmap, QKeySequence
+        QIcon, QAction, QPainter, QColor, QPen, QPixmap, QKeySequence,
+        QLinearGradient
     )
     from PyQt6.QtWidgets import (
         QApplication, QWidget, QMenu, QMessageBox, QLabel,
@@ -554,6 +555,42 @@ QScrollBar::handle:vertical:hover { background: #3f4655; }
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 """
 QSS = QSS.replace("#3d4椒a", "#3d434f")
+
+
+def icon_pixmap(size):
+    """The PIP glyph: a screen with a smaller inset panel. Drawn in code so
+    there is no external asset to ship or lose."""
+    scale = size / 64.0
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    gradient = QLinearGradient(0, 0, 0, size)
+    gradient.setColorAt(0.0, QColor(96, 141, 255))
+    gradient.setColorAt(1.0, QColor(59, 96, 214))
+    painter.setBrush(gradient)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawRoundedRect(QRectF(3 * scale, 8 * scale, 58 * scale, 48 * scale),
+                             11 * scale, 11 * scale)
+
+    # Screen area, darkened so the inset panel reads at small sizes.
+    painter.setBrush(QColor(23, 30, 54, 150))
+    painter.drawRoundedRect(QRectF(9 * scale, 14 * scale, 46 * scale, 36 * scale),
+                             6 * scale, 6 * scale)
+
+    painter.setBrush(QColor(255, 255, 255))
+    painter.drawRoundedRect(QRectF(31 * scale, 28 * scale, 21 * scale, 18 * scale),
+                             4 * scale, 4 * scale)
+    painter.end()
+    return pixmap
+
+
+def app_icon():
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        icon.addPixmap(icon_pixmap(size))
+    return icon
 
 
 def max_pip_size():
@@ -1904,7 +1941,7 @@ class PipController(QObject):
         self._save_geom_timer.setInterval(600)
         self._save_geom_timer.timeout.connect(self.persist_pip_geometry)
 
-        self.tray = QSystemTrayIcon(self._make_icon())
+        self.tray = QSystemTrayIcon(app_icon())
         self.tray.setToolTip("TalesPIP")
         menu = QMenu()
         menu.setStyleSheet(QSS)
@@ -2107,19 +2144,6 @@ class PipController(QObject):
                     QTimer.singleShot(0, w.rebind_target)
             elif w.isVisible():
                 w.hide()
-
-    def _make_icon(self):
-        pixmap = QPixmap(64, 64)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setBrush(QColor(76, 125, 255))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(4, 10, 56, 44, 8, 8)
-        painter.setBrush(QColor(255, 255, 255))
-        painter.drawRoundedRect(32, 30, 24, 20, 4, 4)
-        painter.end()
-        return QIcon(pixmap)
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
@@ -2595,6 +2619,7 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setStyleSheet(QSS)
+    app.setWindowIcon(app_icon())
 
     guard = acquire_single_instance()
     if guard is None:

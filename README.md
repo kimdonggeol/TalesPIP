@@ -61,7 +61,7 @@ python tales_pip.py
 
 ```bash
 pip install pyinstaller
-pyinstaller --noconfirm --onefile --windowed --name TalesPIP tales_pip.py
+pyinstaller --noconfirm --onefile --windowed --name TalesPIP --icon assets/TalesPIP.ico tales_pip.py
 ```
 
 `dist/TalesPIP.exe`가 생성됩니다.
