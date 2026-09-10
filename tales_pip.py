@@ -108,7 +108,6 @@ DEFAULT_CONFIG = {
     "presets": {str(i): {"name": f"프리셋 {i}", "width": None, "height": None}
                  for i in range(1, PRESET_COUNT + 1)},
     "active_preset": 1,
-    "auto_switch_preset": True,
     # The game paints its cursor into its own frame, so it cannot be cut out.
     # Fading the PIP instead lets the real cursor show through underneath.
     "notifications": True,
@@ -375,8 +374,11 @@ def load_config():
     config["_needs_pip_migration"] = (
         bool(loaded.get("regions")) and loaded.get("pip_coords") != "relative")
     config["pip_coords"] = "relative"
-    # Dropped: the target is now fixed to TARGET_PROCESS and auto-detected.
-    for obsolete in ("target_process", "target_window_title", "target_window_class"):
+    # Settings that no longer exist: the target is fixed and auto-detected,
+    # preset switching always follows the resolution, and per-preset hotkeys
+    # were replaced by a single show/hide binding.
+    for obsolete in ("target_process", "target_window_title", "target_window_class",
+                      "auto_switch_preset", "preset_hotkeys", "show_cursor_over_pip"):
         config.pop(obsolete, None)
 
     raw = config.get("regions")
@@ -1228,18 +1230,6 @@ class SettingsDialog(QDialog):
 
         # Stacked, not side by side: two buttons in the 300px pane clipped
         # their labels ("현재 해상도로 지정" rendered as "재 해상도로 지").
-        self.btn_use_preset = QPushButton("이 프리셋 사용하기")
-        self.btn_use_preset.setObjectName("Primary")
-        self.btn_use_preset.clicked.connect(self._activate_selected_preset)
-        preset_layout.addWidget(self.btn_use_preset)
-
-        self.btn_capture_res = QPushButton("현재 해상도를 이 프리셋에 지정")
-        self.btn_capture_res.clicked.connect(self._capture_resolution)
-        preset_layout.addWidget(self.btn_capture_res)
-
-        self.chk_auto_switch = QCheckBox("해상도가 바뀌면 자동 전환")
-        self.chk_auto_switch.toggled.connect(self._commit_auto_switch)
-        preset_layout.addWidget(self.chk_auto_switch)
         left_layout.addWidget(preset_card)
 
         list_card, list_layout = make_card("이 프리셋의 PIP")
@@ -1504,8 +1494,6 @@ class SettingsDialog(QDialog):
             self._loading -= 1
         self._loading += 1
         try:
-            self.chk_auto_switch.setChecked(
-                bool(self.controller.config.get("auto_switch_preset", True)))
             self.combo_preset.clear()
             for preset in range(1, PRESET_COUNT + 1):
                 self.combo_preset.addItem(self._preset_caption(preset), preset)
@@ -1544,7 +1532,6 @@ class SettingsDialog(QDialog):
             self.lbl_preset_res.setText(
                 "해상도가 지정되지 않았습니다. 영역을 처음 추가하면 그때의 "
                 "해상도가 기록됩니다.")
-        self.btn_use_preset.setEnabled(preset != self.controller.active_preset)
 
     def reload_region_list(self):
         current = self._selected_id()
@@ -1847,34 +1834,6 @@ class SettingsDialog(QDialog):
             save_config(self.controller.config)
             self.refresh()
 
-    def _capture_resolution(self):
-        hwnd = self.controller.target_hwnd
-        if not hwnd or not user32.IsWindow(hwnd):
-            QMessageBox.information(self, "안내", f"{TARGET_LABEL} 이(가) 실행 중이 아닙니다.")
-            return
-        width, height = client_size_of(hwnd)
-        if width <= 0 or height <= 0:
-            return
-        clash = self.controller.preset_for_resolution(width, height)
-        if clash and clash != self.viewing_preset:
-            QMessageBox.warning(
-                self, "해상도 중복",
-                f"{width}x{height} 은(는) 이미 "
-                f"{self.controller.preset_name(clash)} 에 지정되어 있습니다.")
-            return
-        self.controller.set_preset_resolution(self.viewing_preset, width, height)
-        self.refresh()
-
-    def _activate_selected_preset(self):
-        self.controller.activate_preset(self.viewing_preset, from_auto=True)
-        self.refresh()
-
-    def _commit_auto_switch(self, checked):
-        if self._loading:
-            return
-        self.controller.config["auto_switch_preset"] = checked
-        save_config(self.controller.config)
-
     def _commit_move_preset(self, _index):
         region = self._selected_region()
         if not region or self._loading:
@@ -2004,11 +1963,16 @@ class PipController(QObject):
         self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
 
+        first_run = not os.path.exists(CONFIG_PATH)
+        if first_run:
+            # Run at logon by default; the checkbox in settings turns it off.
+            set_startup_enabled(True)
+
         # The tray icon is the only always-available entry point; if it is
         # unavailable (or hidden in the overflow area on first run) the user
         # would have no way to reach settings once every PIP is click-through.
         # Only surface the window on genuine first run; otherwise stay in the tray.
-        if not QSystemTrayIcon.isSystemTrayAvailable() or not os.path.exists(CONFIG_PATH):
+        if not QSystemTrayIcon.isSystemTrayAvailable() or first_run:
             QTimer.singleShot(0, self.open_settings)
         QTimer.singleShot(0, self.check_process)
         self.update_tray_tooltip()
@@ -2095,8 +2059,6 @@ class PipController(QObject):
     def auto_switch_preset(self, width, height):
         """Follow the game's resolution: crop percentages only hold for the
         client size they were drawn at."""
-        if not self.config.get("auto_switch_preset", True):
-            return
         preset = self.preset_for_resolution(width, height)
         if preset:
             if preset != self.active_preset:
