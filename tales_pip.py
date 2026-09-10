@@ -24,7 +24,16 @@ def _init_dpi_awareness():
 
 _init_dpi_awareness()
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+def _base_dir():
+    """Where config.json and error.log live. A PyInstaller onefile build unpacks
+    itself into a temp folder that is deleted on exit, so __file__ there would
+    silently throw the settings away — use the exe's own folder instead."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+BASE_DIR = _base_dir()
 ERROR_LOG_PATH = os.path.join(BASE_DIR, "error.log")
 
 
@@ -560,7 +569,6 @@ QSS = QSS.replace("#3d4椒a", "#3d434f")
 ICON_JELLY_HI = QColor(150, 196, 255)
 ICON_JELLY_LO = QColor(70, 116, 226)
 ICON_OUTLINE = QColor(28, 58, 130)
-ICON_SCREEN = QColor(20, 38, 92)
 ICON_TEXT = QColor(255, 251, 240)
 
 
@@ -597,16 +605,16 @@ def _tw_path(rect):
 
 
 def icon_pixmap(size):
-    """A jelly bead bezel around a screen showing TW. Drawn in code so there is
-    no external asset to ship, and rendered per size so it survives 16px."""
+    """A TW jelly bead with a PIP panel tucked into its corner. Drawn in code so
+    there is no external asset to ship, and rendered per size for small icons."""
     s = float(size)
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     p = QPainter(pixmap)
     p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-    blob = _jelly_blob(QRectF(s * 0.06, s * 0.08, s * 0.88, s * 0.84))
-    gradient = QLinearGradient(0, s * 0.08, 0, s * 0.92)
+    blob = _jelly_blob(QRectF(s * 0.06, s * 0.06, s * 0.78, s * 0.74))
+    gradient = QLinearGradient(0, s * 0.06, 0, s * 0.80)
     gradient.setColorAt(0.0, ICON_JELLY_HI)
     gradient.setColorAt(0.55, ICON_JELLY_LO)
     gradient.setColorAt(1.0, QColor(40, 86, 196))
@@ -618,26 +626,29 @@ def icon_pixmap(size):
     # Glossy top, clipped to the blob so it reads as a wet surface.
     p.save()
     p.setClipPath(blob)
-    shine = QLinearGradient(0, s * 0.08, 0, s * 0.50)
+    shine = QLinearGradient(0, s * 0.06, 0, s * 0.44)
     shine.setColorAt(0.0, QColor(255, 255, 255, 165))
     shine.setColorAt(1.0, QColor(255, 255, 255, 0))
     p.setPen(Qt.PenStyle.NoPen)
     p.setBrush(shine)
-    p.drawRoundedRect(QRectF(s * 0.06, s * 0.08, s * 0.88, s * 0.40),
+    p.drawRoundedRect(QRectF(s * 0.06, s * 0.06, s * 0.78, s * 0.36),
                        s * 0.05, s * 0.05)
     p.restore()
 
-    p.setPen(QPen(ICON_OUTLINE, s * 0.04))
-    p.setBrush(ICON_SCREEN)
-    p.drawRoundedRect(QRectF(s * 0.20, s * 0.26, s * 0.60, s * 0.44),
-                       s * 0.09, s * 0.09)
-
     p.setPen(Qt.PenStyle.NoPen)
     p.setBrush(ICON_TEXT)
-    p.drawPath(_tw_path(QRectF(s * 0.26, s * 0.36, s * 0.48, s * 0.22)))
+    p.drawPath(_tw_path(QRectF(s * 0.16, s * 0.28, s * 0.54, s * 0.26)))
 
     p.setBrush(QColor(255, 255, 255, 210))
-    p.drawEllipse(QRectF(s * 0.20, s * 0.14, s * 0.16, s * 0.09))
+    p.drawEllipse(QRectF(s * 0.19, s * 0.15, s * 0.15, s * 0.10))
+
+    # The inset panel overlaps the bead's edge, which is what makes it read as
+    # picture-in-picture rather than just a badge.
+    p.setPen(QPen(ICON_OUTLINE, s * 0.055, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    p.setBrush(ICON_TEXT)
+    p.drawRoundedRect(QRectF(s * 0.50, s * 0.54, s * 0.42, s * 0.36),
+                       s * 0.09, s * 0.09)
     p.end()
     return pixmap
 
@@ -2663,10 +2674,23 @@ class PipController(QObject):
             log_exception()
 
 
+ERROR_ALREADY_EXISTS = 183
+
+
 def acquire_single_instance():
-    """Two copies would fight over the global hotkeys and double the PIPs."""
-    handle = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\TalesPIPSingleton")
-    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+    """Two copies would fight over the global hotkeys and double the PIPs.
+
+    The error code must be read through use_last_error: a separate
+    GetLastError() call can pick up an unrelated error set in between, which
+    made this refuse to start with no other instance running. Session-local
+    namespace, since 'Global\\' needs a privilege we cannot count on."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = [wintypes.LPCVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    handle = kernel32.CreateMutexW(None, False, "Local\\TalesPIPSingleton")
+    if not handle:
+        return True          # cannot tell; better to run than to refuse
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         return None
     return handle
 
