@@ -1,0 +1,16 @@
+# 사용자별 설정 · 로그 (개인 환경 정보가 들어감)
+config.json
+config.json.old
+config.json.tmp
+error.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
