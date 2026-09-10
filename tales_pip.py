@@ -2119,6 +2119,11 @@ class PipController(QObject):
             # Write the file straight away rather than waiting for the first
             # change, so it is obvious where settings live.
             save_config(self.config)
+        elif is_startup_enabled():
+            # The stored command is an absolute path, so moving the exe would
+            # leave the entry pointing at a file that is no longer there while
+            # the checkbox still reads as enabled. Re-point it at this build.
+            set_startup_enabled(True)
 
         # The tray icon is the only always-available entry point; if it is
         # unavailable (or hidden in the overflow area on first run) the user
