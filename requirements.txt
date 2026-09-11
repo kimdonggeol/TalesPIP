@@ -1,2 +1,4 @@
 PyQt6
 psutil
+numpy
+opencv-python

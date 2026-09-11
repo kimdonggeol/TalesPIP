@@ -4,6 +4,7 @@ import math
 import threading
 import traceback
 import ctypes
+import base64
 
 def _init_dpi_awareness():
     try:
@@ -88,7 +89,8 @@ try:
         QApplication, QWidget, QMenu, QMessageBox, QLabel,
         QDialog, QListWidget, QListWidgetItem, QPushButton, QHBoxLayout, QVBoxLayout,
         QSystemTrayIcon, QCheckBox, QSpinBox, QSlider, QLineEdit,
-        QStackedWidget, QFrame, QGridLayout, QComboBox, QScrollArea
+        QStackedWidget, QFrame, QGridLayout, QComboBox, QScrollArea,
+        QFileDialog
     )
 except Exception:
     log_exception()
@@ -132,6 +134,12 @@ DEFAULT_PROFILE_HOTKEY = {"mods": MOD_CONTROL, "vk": 0x7A, "text": "Ctrl+F11"}
 # A profile is a set of PIPs inside one preset — typically one per character,
 # since two characters at the same resolution want different regions shown.
 DEFAULT_PROFILE = {"id": "default", "name": "프로필 1"}
+# Auto-hide watches the game's screen for a stored graphic. A trigger sits at a
+# fixed spot for a given client size, so sweeps are only the cost of finding it
+# the first time; after that one small box is re-checked, faster while it is up
+# so the PIPs come back promptly once the window closes.
+DEFAULT_AUTO_HIDE = {"enabled": True, "sweep_ms": 500, "track_ms": 150,
+                      "threshold": 92, "triggers": []}
 DEFAULT_CONFIG = {
     "always_on_top": True,
     "refresh_ms": 100,
@@ -157,6 +165,7 @@ DEFAULT_CONFIG = {
     # pip x/y are offsets from the target's client origin, not screen coords.
     "check_updates": True,
     "pip_coords": "relative",
+    "auto_hide": copy.deepcopy(DEFAULT_AUTO_HIDE),
     "regions": [],
 }
 DEFAULT_REGION_OPTS = {"opacity": 100, "click_through": False, "preset": 1,
@@ -165,6 +174,7 @@ DEFAULT_REGION_OPTS = {"opacity": 100, "click_through": False, "preset": 1,
 
 user32 = ctypes.windll.user32
 dwmapi = ctypes.windll.dwmapi
+gdi32 = ctypes.windll.gdi32
 
 GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
@@ -353,6 +363,100 @@ def client_size_of(hwnd):
 
 DEFAULT_PIP = {"x": 100, "y": 100, "w": 320, "h": 240}
 
+# Screen matching is optional: without numpy and OpenCV everything else still
+# runs, the auto-hide feature just reports itself unavailable.
+try:
+    import numpy as _np
+    import cv2 as _cv2
+except Exception:
+    _np = _cv2 = None
+
+MATCHING_AVAILABLE = _np is not None and _cv2 is not None
+SRCCOPY = 0x00CC0020
+HALFTONE = 4
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                ("biClrImportant", wintypes.DWORD)]
+
+
+def grab_screen(x, y, w, h, out_w=None, out_h=None):
+    """A rectangle of the desktop as a BGR array. The game draws through
+    DirectX, so its own window cannot be read with PrintWindow — reading the
+    composited screen is the only way to see what it is showing.
+
+    out_w/out_h shrink during the blit, which is far cheaper than scaling the
+    full-size image afterwards."""
+    if not MATCHING_AVAILABLE or w <= 0 or h <= 0:
+        return None
+    out_w, out_h = out_w or w, out_h or h
+    screen = mem = bitmap = None
+    try:
+        screen = user32.GetDC(0)
+        mem = gdi32.CreateCompatibleDC(screen)
+        bitmap = gdi32.CreateCompatibleBitmap(screen, out_w, out_h)
+        gdi32.SelectObject(mem, bitmap)
+        if (out_w, out_h) == (w, h):
+            gdi32.BitBlt(mem, 0, 0, w, h, screen, x, y, SRCCOPY)
+        else:
+            gdi32.SetStretchBltMode(mem, HALFTONE)
+            gdi32.StretchBlt(mem, 0, 0, out_w, out_h, screen, x, y, w, h, SRCCOPY)
+        buffer = _np.empty((out_h, out_w, 4), dtype=_np.uint8)
+        header = _BITMAPINFOHEADER(ctypes.sizeof(_BITMAPINFOHEADER), out_w,
+                                    -out_h, 1, 32, 0, 0, 0, 0, 0, 0)
+        gdi32.GetDIBits(mem, bitmap, 0, out_h,
+                        buffer.ctypes.data_as(ctypes.c_void_p),
+                        ctypes.byref(header), 0)
+        return buffer[:, :, :3]
+    except Exception:
+        log_exception(dialog=False)
+        return None
+    finally:
+        if bitmap:
+            gdi32.DeleteObject(bitmap)
+        if mem:
+            gdi32.DeleteDC(mem)
+        if screen:
+            user32.ReleaseDC(0, screen)
+
+
+def to_gray(image):
+    return _cv2.cvtColor(image, _cv2.COLOR_BGR2GRAY) if image is not None else None
+
+
+def best_match(haystack, needle):
+    """(score, x, y) of the closest match, or None when it cannot be run."""
+    if haystack is None or needle is None:
+        return None
+    if haystack.shape[0] < needle.shape[0] or haystack.shape[1] < needle.shape[1]:
+        return None
+    try:
+        result = _cv2.matchTemplate(haystack, needle, _cv2.TM_CCOEFF_NORMED)
+        _, score, _, where = _cv2.minMaxLoc(result)
+        return float(score), int(where[0]), int(where[1])
+    except Exception:
+        log_exception(dialog=False)
+        return None
+
+
+def encode_png(image):
+    ok, buffer = _cv2.imencode(".png", image)
+    return base64.b64encode(buffer.tobytes()).decode("ascii") if ok else None
+
+
+def decode_png(text):
+    try:
+        raw = _np.frombuffer(base64.b64decode(text), dtype=_np.uint8)
+        return _cv2.imdecode(raw, _cv2.IMREAD_COLOR)
+    except Exception:
+        log_exception(dialog=False)
+        return None
+
 
 def parse_version(text):
     """'v1.2.3' -> (1, 2, 3); unparsable parts become 0 so a odd tag never
@@ -432,6 +536,37 @@ def set_startup_enabled(enabled):
     except OSError:
         log_exception(dialog=False)
         return False
+
+
+def normalize_auto_hide(raw):
+    auto = copy.deepcopy(DEFAULT_AUTO_HIDE)
+    if not isinstance(raw, dict):
+        return auto
+    auto["enabled"] = bool(raw.get("enabled", True))
+    for key, low, high in (("sweep_ms", 100, 5000), ("track_ms", 50, 2000),
+                            ("threshold", 50, 100)):
+        value = raw.get(key)
+        if isinstance(value, int) and low <= value <= high:
+            auto[key] = value
+    entries = raw.get("triggers")
+    for trigger in entries if isinstance(entries, list) else []:
+        if not isinstance(trigger, dict) or not isinstance(trigger.get("image"), str):
+            continue
+        name = trigger.get("name")
+        entry = {
+            "id": str(trigger.get("id") or uuid.uuid4()),
+            "name": name if isinstance(name, str) and name.strip() else "숨김 조건",
+            "enabled": bool(trigger.get("enabled", True)),
+            "image": trigger["image"],
+            "found": {},
+        }
+        found = trigger.get("found")
+        for key, spot in (found if isinstance(found, dict) else {}).items():
+            if (str(key).isdigit() and isinstance(spot, list) and len(spot) == 2
+                    and all(isinstance(n, int) for n in spot)):
+                entry["found"][str(key)] = [spot[0], spot[1]]
+        auto["triggers"].append(entry)
+    return auto
 
 
 def load_config():
@@ -531,6 +666,7 @@ def load_config():
     active = config.get("active_preset")
     config["active_preset"] = active if isinstance(active, int) and 1 <= active <= PRESET_COUNT else 1
 
+    config["auto_hide"] = normalize_auto_hide(config.get("auto_hide"))
     config["toggle_hotkey"] = normalize_hotkey(config.get("toggle_hotkey"))
     config["profile_hotkey"] = normalize_hotkey(config.get("profile_hotkey"))
     # Always-on-top is not user-configurable; a PIP that can hide behind the
@@ -1563,6 +1699,34 @@ class SettingsDialog(QDialog):
 
         left_layout.addWidget(global_card)
 
+        auto_card, auto_layout = make_card("자동 숨김 (화면 감지)")
+        self.chk_auto_hide = QCheckBox("등록한 그래픽이 보이면 PIP 숨김")
+        self.chk_auto_hide.toggled.connect(self._commit_auto_hide)
+        auto_layout.addWidget(self.chk_auto_hide)
+
+        self.trigger_list = QListWidget()
+        self.trigger_list.setMinimumHeight(96)
+        self.trigger_list.itemChanged.connect(self._on_trigger_checked)
+        auto_layout.addWidget(self.trigger_list)
+
+        trigger_row = QHBoxLayout()
+        btn_trigger_add = QPushButton("화면에서 추가")
+        btn_trigger_add.clicked.connect(self._add_trigger)
+        btn_trigger_file = QPushButton("이미지 파일")
+        btn_trigger_file.clicked.connect(self._add_trigger_file)
+        btn_trigger_del = QPushButton("삭제")
+        btn_trigger_del.setObjectName("Danger")
+        btn_trigger_del.clicked.connect(self._delete_trigger)
+        for button in (btn_trigger_add, btn_trigger_file, btn_trigger_del):
+            trigger_row.addWidget(button)
+        auto_layout.addLayout(trigger_row)
+
+        self.lbl_auto_hide = QLabel("")
+        self.lbl_auto_hide.setObjectName("Caption")
+        self.lbl_auto_hide.setWordWrap(True)
+        auto_layout.addWidget(self.lbl_auto_hide)
+        left_layout.addWidget(auto_card)
+
         hotkey_card, hotkey_layout = make_card("단축키")
         self.hotkey_edit = HotkeyEdit()
         self.hotkey_edit.captured.connect(self._commit_hotkey)
@@ -1782,6 +1946,9 @@ class SettingsDialog(QDialog):
             # The registry is the source of truth, not config.json.
             self.chk_startup.setChecked(is_startup_enabled())
             self.chk_updates.setChecked(bool(self.controller.config.get("check_updates", True)))
+            self.chk_auto_hide.setChecked(
+                bool(self.controller.auto_hide_options().get("enabled", True)))
+            self.chk_auto_hide.setEnabled(MATCHING_AVAILABLE)
             self.chk_notify.setChecked(bool(self.controller.config.get("notifications", True)))
             self.chk_hover.setChecked(bool(self.controller.config.get("dim_on_hover", True)))
             hover = int(self.controller.config.get("hover_opacity", 60))
@@ -1806,6 +1973,7 @@ class SettingsDialog(QDialog):
             self.show_update(self.controller.latest_version)
         self._load_preset_fields()
         self._reload_profile_combo()
+        self.reload_trigger_list()
         self.update_preset_state()
         self.reload_region_list()
 
@@ -2184,6 +2352,94 @@ class SettingsDialog(QDialog):
             self._reload_profile_combo()
             self.reload_region_list()
 
+    def reload_trigger_list(self):
+        current = None
+        item = self.trigger_list.currentItem()
+        if item:
+            current = item.data(Qt.ItemDataRole.UserRole)
+        self._loading += 1
+        try:
+            self.trigger_list.clear()
+            for trigger in self.controller.auto_hide_triggers():
+                entry = QListWidgetItem(trigger.get("name", "조건"))
+                entry.setData(Qt.ItemDataRole.UserRole, trigger["id"])
+                entry.setFlags(entry.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                entry.setCheckState(Qt.CheckState.Checked if trigger.get("enabled", True)
+                                     else Qt.CheckState.Unchecked)
+                self.trigger_list.addItem(entry)
+                if trigger["id"] == current:
+                    self.trigger_list.setCurrentItem(entry)
+        finally:
+            self._loading -= 1
+        self.update_auto_hide_state()
+
+    def update_auto_hide_state(self):
+        controller = self.controller
+        options = controller.auto_hide_options()
+        count = len(options.get("triggers", []))
+        if not MATCHING_AVAILABLE:
+            text = "이 빌드에는 화면 감지 기능이 포함되지 않았습니다."
+        elif not options.get("enabled", True):
+            text = "꺼져 있습니다."
+        elif not count:
+            text = ("가리고 싶은 창을 게임에서 열어둔 뒤 "
+                     "화면에서 추가를 누르고 그 창의 고유한 부분을 드래그하세요.")
+        elif controller.auto_hidden:
+            found = controller.watcher.last_hit or "조건"
+            text = f"{found} 을(를) 찾아 PIP를 숨기는 중입니다."
+        else:
+            text = f"감시 중입니다. 등록된 조건 {count}개."
+        self.lbl_auto_hide.setText(text)
+
+    def _commit_auto_hide(self, checked):
+        if self._loading:
+            return
+        self.controller.auto_hide_options()["enabled"] = bool(checked)
+        save_config(self.controller.config)
+        self.controller.watcher.reload()
+        self.update_auto_hide_state()
+
+    def _on_trigger_checked(self, item):
+        if self._loading:
+            return
+        self.controller.set_trigger_enabled(
+            item.data(Qt.ItemDataRole.UserRole),
+            item.checkState() == Qt.CheckState.Checked)
+        self.update_auto_hide_state()
+
+    def _add_trigger(self):
+        self.controller.begin_capture_trigger(on_done=self.refresh)
+
+    def _add_trigger_file(self):
+        if not MATCHING_AVAILABLE:
+            QMessageBox.information(self, "안내",
+                                     "이 빌드에는 화면 감지 기능이 포함되지 않았습니다.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "숨김 조건으로 쓸 이미지", "",
+            "이미지 (*.png *.jpg *.jpeg *.bmp)")
+        if not path:
+            return
+        image = _cv2.imdecode(
+            _np.fromfile(path, dtype=_np.uint8), _cv2.IMREAD_COLOR)
+        if image is None:
+            QMessageBox.warning(self, "안내", "이미지를 읽지 못했습니다.")
+            return
+        self.controller.add_trigger(image, os.path.splitext(os.path.basename(path))[0])
+        self.refresh()
+
+    def _delete_trigger(self):
+        item = self.trigger_list.currentItem()
+        if not item:
+            return
+        if QMessageBox.question(
+                self, "조건 삭제", f"{item.text()} 을(를) 삭제합니다.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        self.controller.delete_trigger(item.data(Qt.ItemDataRole.UserRole))
+        self.refresh()
+
     def _hotkey_editor(self, key):
         return (self.profile_hotkey_edit if key == "profile_hotkey"
                 else self.hotkey_edit)
@@ -2347,6 +2603,164 @@ class SettingsDialog(QDialog):
             self.refresh()
 
 
+class TriggerWatcher(QObject):
+    """Hides the PIPs while a stored graphic is on the game's screen.
+
+    Finding a trigger costs a sweep of the whole client. Its position is fixed
+    for a given client size, so the spot is remembered per preset and only that
+    box is re-checked afterwards, which is an order of magnitude cheaper."""
+
+    SWEEP_SCALE = 2       # sweeps run at half resolution
+    REFINE_MARGIN = 6     # px searched around a sweep hit to pin it exactly
+
+    def __init__(self, controller):
+        super().__init__()
+        self.controller = controller
+        self.matched = False
+        self.last_hit = None
+        self._templates = {}
+        self._sweep_index = 0
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+
+    def options(self):
+        return self.controller.config.get("auto_hide") or {}
+
+    def triggers(self):
+        return [t for t in self.options().get("triggers", []) if t.get("enabled", True)]
+
+    def usable(self):
+        return MATCHING_AVAILABLE and bool(self.options().get("enabled", True))
+
+    def start(self):
+        self.retime()
+
+    def stop(self):
+        self.timer.stop()
+        self._set_matched(False)
+
+    def reload(self):
+        """Templates and remembered spots are stale once the list is edited."""
+        self._templates.clear()
+        self._set_matched(False)
+        self.retime()
+
+    def retime(self):
+        if not self.usable() or not self.triggers():
+            self.timer.stop()
+            return
+        wanted = int(self.options().get("track_ms", 150) if self.matched
+                      else self.options().get("sweep_ms", 500))
+        if self.timer.interval() != wanted:
+            self.timer.setInterval(wanted)
+        if not self.timer.isActive():
+            self.timer.start(wanted)
+
+    def template(self, trigger):
+        """(full gray, half gray) for one trigger, decoded once."""
+        cached = self._templates.get(trigger["id"])
+        if cached is None:
+            image = decode_png(trigger["image"])
+            if image is None:
+                cached = (None, None)
+            else:
+                full = to_gray(image)
+                half = _cv2.resize(full, (max(1, full.shape[1] // self.SWEEP_SCALE),
+                                           max(1, full.shape[0] // self.SWEEP_SCALE)),
+                                    interpolation=_cv2.INTER_AREA)
+                cached = (full, half)
+            self._templates[trigger["id"]] = cached
+        return cached
+
+    def tick(self):
+        try:
+            if not self.usable():
+                self._set_matched(False)
+                self.timer.stop()
+                return
+            triggers = self.triggers()
+            hwnd = self.controller.target_hwnd
+            if (not triggers or not hwnd or not user32.IsWindow(hwnd)
+                    or is_minimized(hwnd) or not self.controller.was_running):
+                self._set_matched(False)
+                self.retime()
+                return
+            rect = get_client_rect_on_screen(hwnd)
+            if not rect:
+                return
+            left, top, right, bottom = rect
+            client = (left, top, right - left, bottom - top)
+            if client[2] <= 0 or client[3] <= 0:
+                return
+            threshold = self.options().get("threshold", 92) / 100.0
+            preset = str(self.controller.active_preset)
+
+            # Known spots first: this is the cheap path and the usual answer.
+            for trigger in triggers:
+                if self.check_known(trigger, preset, client, threshold):
+                    self._set_matched(True, trigger)
+                    self.retime()
+                    return
+            # One sweep per tick, so several triggers never stack into one frame.
+            self._sweep_index = (self._sweep_index + 1) % len(triggers)
+            if self.sweep(triggers[self._sweep_index], preset, client, threshold):
+                self._set_matched(True, triggers[self._sweep_index])
+                self.retime()
+                return
+            self._set_matched(False)
+            self.retime()
+        except Exception:
+            log_exception(dialog=False)
+
+    def check_known(self, trigger, preset, client, threshold):
+        spot = trigger.get("found", {}).get(preset)
+        full, _ = self.template(trigger)
+        if not spot or full is None:
+            return False
+        left, top, width, height = client
+        x, y = spot
+        th, tw = full.shape[:2]
+        if x < 0 or y < 0 or x + tw > width or y + th > height:
+            return False
+        patch = to_gray(grab_screen(left + x, top + y, tw, th))
+        hit = best_match(patch, full)
+        return bool(hit and hit[0] >= threshold)
+
+    def sweep(self, trigger, preset, client, threshold):
+        """Half-resolution pass over the whole client, then a full-resolution
+        check around the hit so the stored spot is exact."""
+        full, half = self.template(trigger)
+        if full is None:
+            return False
+        left, top, width, height = client
+        scale = self.SWEEP_SCALE
+        frame = to_gray(grab_screen(left, top, width, height,
+                                     width // scale, height // scale))
+        hit = best_match(frame, half)
+        if not hit or hit[0] < threshold:
+            return False
+        th, tw = full.shape[:2]
+        margin = self.REFINE_MARGIN
+        x = max(0, min(width - tw, hit[1] * scale - margin))
+        y = max(0, min(height - th, hit[2] * scale - margin))
+        area = to_gray(grab_screen(left + x, top + y,
+                                    min(tw + margin * 2, width - x),
+                                    min(th + margin * 2, height - y)))
+        refined = best_match(area, full)
+        if not refined or refined[0] < threshold:
+            return False
+        trigger.setdefault("found", {})[preset] = [x + refined[1], y + refined[2]]
+        save_config(self.controller.config)
+        return True
+
+    def _set_matched(self, matched, trigger=None):
+        self.last_hit = trigger.get("name") if matched and trigger else None
+        if matched == self.matched:
+            return
+        self.matched = matched
+        self.controller.on_auto_hide_changed(matched, self.last_hit)
+
+
 class PipController(QObject):
     def __init__(self):
         super().__init__()
@@ -2363,6 +2777,8 @@ class PipController(QObject):
         self._busy = False
         self.active_preset = self.config["active_preset"]
         self.pips_hidden = False
+        self.auto_hidden = False
+        self.watcher = TriggerWatcher(self)
         self._hotkey_hwnd = None
         self._hotkey_holder = None
         self._registered_hotkeys = set()
@@ -2560,6 +2976,117 @@ class PipController(QObject):
             return
         self.tray.showMessage(title, message,
                                icon or QSystemTrayIcon.MessageIcon.Information, msecs)
+
+    def on_auto_hide_changed(self, matched, name=None):
+        """The watcher found or lost a trigger graphic on the game's screen."""
+        self.auto_hidden = matched
+        self.apply_visibility()
+        self.update_tray_tooltip()
+        if self.settings_dialog and self.settings_dialog.isVisible():
+            self.settings_dialog.update_auto_hide_state()
+
+    def auto_hide_options(self):
+        return self.config.setdefault("auto_hide", copy.deepcopy(DEFAULT_AUTO_HIDE))
+
+    def auto_hide_triggers(self):
+        return self.auto_hide_options().setdefault("triggers", [])
+
+    MIN_TRIGGER_DETAIL = 6.0   # grey standard deviation
+
+    def add_trigger(self, image, name=None):
+        """image is a BGR array. Returns the stored trigger, or None."""
+        if image is None:
+            return None
+        # A flat patch correlates with everything, so it would hide the PIPs
+        # permanently. Refuse it rather than let the user wonder why.
+        if float(to_gray(image).std()) < self.MIN_TRIGGER_DETAIL:
+            QMessageBox.information(
+                self.settings_dialog, "안내",
+                "고른 부분은 무늬가 거의 없어 다른 화면과 구분할 수 없습니다.\n"
+                "글자나 테두리처럼 특징이 있는 부분을 골라 주세요.")
+            return None
+        encoded = encode_png(image)
+        if not encoded:
+            return None
+        height, width = image.shape[:2]
+        triggers = self.auto_hide_triggers()
+        trigger = {
+            "id": str(uuid.uuid4()),
+            "name": name or f"조건 {len(triggers) + 1}",
+            "enabled": True,
+            "image": encoded,
+            "found": {},
+        }
+        triggers.append(trigger)
+        save_config(self.config)
+        self.watcher.reload()
+        self.refresh_settings()
+        return trigger
+
+    def delete_trigger(self, trigger_id):
+        options = self.auto_hide_options()
+        options["triggers"] = [t for t in options.get("triggers", [])
+                                if t.get("id") != trigger_id]
+        save_config(self.config)
+        self.watcher.reload()
+        self.refresh_settings()
+
+    def set_trigger_enabled(self, trigger_id, enabled):
+        for trigger in self.auto_hide_triggers():
+            if trigger.get("id") == trigger_id:
+                trigger["enabled"] = bool(enabled)
+                break
+        save_config(self.config)
+        self.watcher.reload()
+
+    def forget_trigger_spots(self, trigger_id=None):
+        """Drop the remembered positions so the next tick sweeps again."""
+        for trigger in self.auto_hide_triggers():
+            if trigger_id is None or trigger.get("id") == trigger_id:
+                trigger["found"] = {}
+        save_config(self.config)
+        self.watcher.reload()
+
+    def begin_capture_trigger(self, on_done=None):
+        """Freeze the client, let the user outline a graphic on it, and keep
+        those pixels. The still is taken before the picker covers the screen,
+        so what gets stored is the game itself and not our own mirror of it."""
+        if not MATCHING_AVAILABLE:
+            QMessageBox.information(self.settings_dialog, "안내",
+                                     "이 빌드에는 화면 감지 기능이 포함되지 않았습니다.")
+            return
+        hwnd = self.resolve_target_hwnd()
+        rect = get_client_rect_on_screen(hwnd) if hwnd else None
+        if not rect:
+            QMessageBox.information(self.settings_dialog, "안내",
+                                     f"{TARGET_LABEL} 이(가) 실행 중이 아닙니다.")
+            return
+        left, top, right, bottom = rect
+        frame = grab_screen(left, top, right - left, bottom - top)
+        if frame is None:
+            QMessageBox.information(self.settings_dialog, "안내",
+                                     "화면을 읽지 못했습니다.")
+            return
+        picker = self._open_picker()
+        if not picker:
+            return
+        picker.set_prompt("숨김 조건 추가",
+                           "숨김 기준으로 쓸 그래픽을 드래그하세요   ·   ESC 로 취소")
+        picker.finished.connect(
+            lambda x, y, w, h: self._on_trigger_selected(frame, x, y, w, h, on_done))
+        picker.show()
+
+    def _on_trigger_selected(self, frame, x, y, w, h, on_done=None):
+        height, width = frame.shape[:2]
+        x0, y0 = int(x * width), int(y * height)
+        x1, y1 = x0 + max(1, int(w * width)), y0 + max(1, int(h * height))
+        crop = frame[y0:min(y1, height), x0:min(x1, width)]
+        if crop.size == 0:
+            return
+        self.add_trigger(crop.copy())
+        self.focus_target()
+        if on_done:
+            on_done()
 
     def toggle_hidden(self):
         self.pips_hidden = not self.pips_hidden
@@ -2811,7 +3338,8 @@ class PipController(QObject):
             self.apply_visibility()
 
     def region_is_visible(self, region):
-        if not self.was_running or not self.target_active or self.pips_hidden:
+        if (not self.was_running or not self.target_active or self.pips_hidden
+                or self.auto_hidden):
             return False
         return (region.get("preset") == self.active_preset
                  and region.get("profile") == self.active_profile_id())
@@ -2944,6 +3472,7 @@ class PipController(QObject):
             self.ensure_pip_window(region)
         self.apply_visibility()
         self.rebind_all_pip_windows()
+        self.watcher.start()
         self.update_tray_tooltip()
         if self.settings_dialog and self.settings_dialog.isVisible():
             self.settings_dialog.refresh()
@@ -2955,6 +3484,7 @@ class PipController(QObject):
             return
         self.target_hwnd = None
         self._last_client_rect = None
+        self.watcher.stop()
         for w in self.pip_windows.values():
             w.hide()
             dwm_unregister_thumbnail(w.thumb_id)
@@ -2994,6 +3524,8 @@ class PipController(QObject):
             self.tray.setToolTip(f"TalesPIP — {TARGET_LABEL} 실행 대기 중")
             return
         state = f"TalesPIP — {self.preset_name(self.active_preset)}"
+        if self.auto_hidden:
+            state += " (자동 숨김)"
         if len(self.preset_profiles(self.active_preset)) > 1:
             state += f" / {self.profile_name(self.active_preset, self.active_profile_id())}"
         self.tray.setToolTip(state + (" (숨김)" if self.pips_hidden else ""))
