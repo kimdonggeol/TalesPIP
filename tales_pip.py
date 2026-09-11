@@ -2671,6 +2671,53 @@ class SettingsDialog(QDialog):
             self.refresh()
 
 
+def search_area(hwnd, box, template):
+    """Best likeness of template inside one rectangle of the client, as
+    (score, x, y) relative to that rectangle. A plain function so it can run
+    on a worker thread without touching anything the interface owns."""
+    x, y, w, h = box
+    return best_match(to_gray(grab_client(hwnd, x, y, w, h)), template)
+
+
+class SweepWorker:
+    """Runs one search at a time away from the interface thread.
+
+    A single match over the middle of a 1920x1440 client takes about 17ms and
+    the whole client 45ms. On the thread that draws and drags the PIPs that is
+    long enough to feel, and it put a ceiling on how often the watcher could
+    afford to look. Off it, the only limit left is a spare core.
+
+    The answer is left here to be collected rather than announced, because a
+    search still running while the program closes would otherwise deliver into
+    an object Qt has already torn down."""
+
+    def __init__(self):
+        self.busy = False
+        self._result = None
+
+    def start(self, hwnd, box, template):
+        self._result = None
+        self.busy = True
+        threading.Thread(target=self._run, args=(hwnd, box, template),
+                          daemon=True).start()
+
+    def _run(self, hwnd, box, template):
+        hit = None
+        try:
+            hit = search_area(hwnd, box, template)
+        except Exception:
+            log_exception(dialog=False)
+        # The result is in place before the flag drops, so a reader that sees
+        # the search finished always sees what it found.
+        self._result = (hit,)
+        self.busy = False
+
+    def take(self):
+        """(hit,) once, then None until the next search finishes."""
+        out, self._result = self._result, None
+        return out
+
+
 class TriggerWatcher(QObject):
     """Hides the PIPs while a stored graphic is on the game's screen.
 
@@ -2680,12 +2727,11 @@ class TriggerWatcher(QObject):
 
     REFINE_MARGIN = 6     # px searched around a sweep hit to pin it exactly
     GROUP_READ_MIN = 3            # spots in one area worth reading together
-    SWEEP_BUDGET_MS = 8           # routine searching per tick, at most
-    SWEEP_MIN_GAP_MS = 400        # and no two routine searches closer than this
+    SWEEP_MIN_GAP_MS = 400        # no two routine searches closer than this
     # Until a window has been seen once there is nothing to check cheaply, so
     # the only way to notice it is to go looking. That phase is worth hurrying
     # through: it happens once per window, and after it the spot is known.
-    SWEEP_MIN_GAP_COLD_MS = 150
+    SWEEP_MIN_GAP_COLD_MS = 0
     SWEEP_BACKOFF_MAX_MS = 4000   # how far a never-seen graphic is pushed out
     # One already found and now missing is almost always a closed window, and
     # reopening it lands on the remembered spot, which costs nothing to check.
@@ -2701,6 +2747,8 @@ class TriggerWatcher(QObject):
         self._due = {}
         self._backoff = {}
         self._requirement_unmet = False
+        self._inflight = None
+        self.worker = SweepWorker()
         self._was_located = set()
         self._last_routine = 0.0
         self._cursor = 0
@@ -2728,6 +2776,7 @@ class TriggerWatcher(QObject):
         self._templates.clear()
         self._due.clear()
         self._backoff.clear()
+        self._inflight = None
         self._was_located = set()
         self._set_matched(False)
         self.retime()
@@ -2792,6 +2841,9 @@ class TriggerWatcher(QObject):
                 return
 
             now = time.monotonic()
+            done = self.worker.take()
+            if done is not None:
+                self._on_searched(done[0])
             located = self.check_all_known(triggers, preset, client, threshold)
             required = [t for t in triggers if t.get("mode") == "show"]
             self._requirement_unmet = bool(required) and not any(
@@ -2808,66 +2860,108 @@ class TriggerWatcher(QObject):
 
         A graphic that was there a moment ago and is not now has either been
         closed or dragged elsewhere, and there is no telling which without
-        looking, so it gets one search of the whole client straight away.
+        looking, so it goes to the front of the queue and the whole client is
+        searched for it.
 
         Everything else opens where its anchor says it does, so a routine pass
-        only covers that, which is a third of the work. Each miss pushes that
-        trigger further out, up to a few seconds, so the windows a player never
-        opens settle down to costing almost nothing."""
+        only covers that. Each miss pushes that trigger further out, up to a
+        few seconds, so the windows a player never opens settle down to costing
+        almost nothing.
+
+        Either way the search itself happens on the worker, one at a time; this
+        only decides what to look for next."""
+        # What was there last time and is not now, worked out before this
+        # tick's answer replaces it.
         lost = [t for t in triggers
                  if not located[t["id"]] and t["id"] in self._was_located]
-        for trigger in lost:
-            if self.sweep(trigger, preset, client, threshold, wide=True):
-                located[trigger["id"]] = True
-                self._backoff.pop(trigger["id"], None)
-                self._due.pop(trigger["id"], None)
+        self._was_located = {i for i, yes in located.items() if yes}
+        if self.worker.busy:
+            return
+        if lost:
+            self._dispatch(lost[0], preset, client, threshold, wide=True)
+            return
 
-        # One search can cost more than a whole tick, so a per-tick budget
-        # cannot hold the rate down on its own; searches also keep a minimum
-        # gap between them. Together they cap the routine pass at about a
-        # tenth of a core however many conditions are waiting.
         waiting = [t for t in triggers if not located[t["id"]]
                     and self._due.get(t["id"], 0.0) <= now]
         cold = any(not t.get("found", {}).get(preset) for t in waiting)
         gap = self.SWEEP_MIN_GAP_COLD_MS if cold else self.SWEEP_MIN_GAP_MS
         if now - self._last_routine < gap / 1000.0:
-            self._was_located = {i for i, yes in located.items() if yes}
             return
         # While no show condition has been met the PIPs are hidden already, so
         # what a hide condition would say cannot change the outcome. Search for
         # the one that governs whether they appear at all, and nothing else.
         if self._requirement_unmet:
             waiting = [t for t in waiting if t.get("mode") == "show"]
-        # A tick only affords a search or two, so the queue rotates. Ordering
-        # by due time alone would not: several triggers share a due time, which
-        # would leave the head of the list being searched over and over while
-        # the tail never came up.
+        if not waiting:
+            return
+        # The queue rotates. Ordering by due time alone would not: several
+        # triggers share a due time, which would leave the head of the list
+        # being searched over and over while the tail never came up.
         waiting.sort(key=lambda t: (t.get("mode") != "show",
                                      self._due.get(t["id"], 0.0)))
         if self._cursor >= len(waiting):
             self._cursor = 0
-        pending = waiting[self._cursor:] + waiting[:self._cursor]
-        budget = self.SWEEP_BUDGET_MS / 1000.0
-        started = time.monotonic()
-        base = self.options().get("sweep_ms", 500)
-        for trigger in pending:
-            if time.monotonic() - started >= budget:
-                break
-            self._cursor += 1
-            self._last_routine = now
-            if self.sweep(trigger, preset, client, threshold):
-                located[trigger["id"]] = True
+        trigger = waiting[self._cursor]
+        self._cursor += 1
+        self._last_routine = now
+        self._dispatch(trigger, preset, client, threshold)
+
+    def _dispatch(self, trigger, preset, client, threshold, wide=False):
+        full = self.template(trigger)
+        if full is None:
+            return
+        width, height = client[2], client[3]
+        box = anchor_box("all" if wide else trigger.get("anchor", "all"),
+                          width, height)
+        self._inflight = {"id": trigger["id"], "preset": preset, "box": box,
+                           "client": client, "threshold": threshold}
+        self.worker.start(self.controller.target_hwnd, box, full)
+
+    def _on_searched(self, hit):
+        """The worker found the best likeness in the area it was given. Pin it
+        down exactly here, where the extra read is small and cheap."""
+        job, self._inflight = self._inflight, None
+        if not job:
+            return
+        try:
+            trigger = next((t for t in self.triggers() if t["id"] == job["id"]), None)
+            if trigger is None:
+                return
+            preset, threshold = job["preset"], job["threshold"]
+            spot = self._pin_down(trigger, hit, job) if hit else None
+            if spot:
+                trigger.setdefault("found", {})[preset] = spot
+                save_config(self.controller.config)
                 self._backoff.pop(trigger["id"], None)
                 self._due.pop(trigger["id"], None)
                 self._cursor = 0
-                break
+                return
+            base = self.options().get("sweep_ms", 500)
             ceiling = (self.SWEEP_BACKOFF_CLOSED_MS
                         if trigger.get("found", {}).get(preset)
                         else self.SWEEP_BACKOFF_MAX_MS)
             wait = min(max(base, self._backoff.get(trigger["id"], 0) * 2), ceiling)
             self._backoff[trigger["id"]] = wait
-            self._due[trigger["id"]] = now + wait / 1000.0
-        self._was_located = {i for i, yes in located.items() if yes}
+            self._due[trigger["id"]] = time.monotonic() + wait / 1000.0
+        except Exception:
+            log_exception(dialog=False)
+
+    def _pin_down(self, trigger, hit, job):
+        full = self.template(trigger)
+        if full is None or hit[0] < job["threshold"]:
+            return None
+        width, height = job["client"][2], job["client"][3]
+        ax, ay = job["box"][0], job["box"][1]
+        th, tw = full.shape[:2]
+        margin = self.REFINE_MARGIN
+        x = max(0, min(width - tw, ax + hit[1] - margin))
+        y = max(0, min(height - th, ay + hit[2] - margin))
+        refined = best_match(
+            self._region(x, y, min(tw + margin * 2, width - x),
+                          min(th + margin * 2, height - y)), full)
+        if not refined or refined[0] < job["threshold"]:
+            return None
+        return [x + refined[1], y + refined[2]]
 
     def _decide(self, triggers, located):
         """Two kinds of condition, and hiding wins:
@@ -2946,32 +3040,6 @@ class TriggerWatcher(QObject):
         # The spot is already known, so this is a yes or no, not a search.
         score = correlation(self._region(x, y, tw, th), full)
         return bool(score is not None and score >= threshold)
-
-    def sweep(self, trigger, preset, client, threshold, wide=False):
-        """A pass over the trigger's search area, then a check around the hit
-        so the stored spot is exact. wide ignores the anchor and covers the
-        whole client, which is what a window that has been dragged needs."""
-        full = self.template(trigger)
-        if full is None:
-            return False
-        width, height = client[2], client[3]
-        ax, ay, aw, ah = anchor_box(
-            "all" if wide else trigger.get("anchor", "all"), width, height)
-        hit = best_match(self._region(ax, ay, aw, ah), full)
-        if not hit or hit[0] < threshold:
-            return False
-        th, tw = full.shape[:2]
-        margin = self.REFINE_MARGIN
-        x = max(0, min(width - tw, ax + hit[1] - margin))
-        y = max(0, min(height - th, ay + hit[2] - margin))
-        refined = best_match(
-            self._region(x, y, min(tw + margin * 2, width - x),
-                          min(th + margin * 2, height - y)), full)
-        if not refined or refined[0] < threshold:
-            return False
-        trigger.setdefault("found", {})[preset] = [x + refined[1], y + refined[2]]
-        save_config(self.controller.config)
-        return True
 
     def _set_matched(self, matched, reason=None):
         self.reason = reason if matched else None
