@@ -98,7 +98,6 @@ TARGET_PROCESS = "InphaseNXD.exe"
 TARGET_LABEL = "테일즈위버"  # shown in the UI instead of the process name
 
 APP_VERSION = "1.0.2"
-APP_AUTHOR = "하이아칸 · 김동걸"
 REPO_URL = "https://github.com/kimdonggeol/TalesPIP"
 LATEST_RELEASE_API = "https://api.github.com/repos/kimdonggeol/TalesPIP/releases/latest"
 RELEASES_URL = REPO_URL + "/releases/latest"
@@ -132,7 +131,7 @@ DEFAULT_TOGGLE_HOTKEY = {"mods": MOD_CONTROL, "vk": 0x7B, "text": "Ctrl+F12"}
 DEFAULT_PROFILE_HOTKEY = {"mods": MOD_CONTROL, "vk": 0x7A, "text": "Ctrl+F11"}
 # A profile is a set of PIPs inside one preset — typically one per character,
 # since two characters at the same resolution want different regions shown.
-DEFAULT_PROFILE = {"id": "default", "name": "기본"}
+DEFAULT_PROFILE = {"id": "default", "name": "프로필 1"}
 DEFAULT_CONFIG = {
     "always_on_top": True,
     "refresh_ms": 100,
@@ -1639,13 +1638,9 @@ class SettingsDialog(QDialog):
         bottom = QHBoxLayout()
         self.lbl_path = QLabel(CONFIG_PATH)
         self.lbl_path.setObjectName("Caption")
-        self.lbl_author = QLabel(f"제작자 {APP_AUTHOR}")
-        self.lbl_author.setObjectName("Caption")
         btn_close = QPushButton("닫기")
         btn_close.clicked.connect(self.accept)
         bottom.addWidget(self.lbl_path, 1)
-        bottom.addWidget(self.lbl_author)
-        bottom.addSpacing(12)
         bottom.addWidget(btn_close)
         right_layout.addLayout(bottom)
 
