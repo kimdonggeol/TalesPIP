@@ -17,3 +17,7 @@ dist/
 
 # 내부 개발 기록
 IMPROVEMENTS.md
+
+# staging copies of trigger graphics; the installed ones live in assets/triggers
+assets/hide_*.png
+assets/show_*.png

@@ -157,7 +157,7 @@ except Exception:
 TARGET_PROCESS = "InphaseNXD.exe"
 TARGET_LABEL = "테일즈위버"  # shown in the UI instead of the process name
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.1.0"
 REPO_URL = "https://github.com/kimdonggeol/TalesPIP"
 LATEST_RELEASE_API = "https://api.github.com/repos/kimdonggeol/TalesPIP/releases/latest"
 RELEASES_URL = REPO_URL + "/releases/latest"
