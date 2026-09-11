@@ -60,7 +60,10 @@ def main():
         mark = "  FOUND" if anywhere and anywhere[0] >= threshold else ""
         where = f"({anywhere[1]}, {anywhere[2]})" if anywhere else "-"
         outside = ""
-        if anywhere and inside and anywhere[0] - inside[0] > 0.05:
+        # Only worth saying when the match is plausible; with nothing on screen
+        # the best score lands somewhere arbitrary and means nothing.
+        if (anywhere and inside and anywhere[0] >= 0.7
+                and anywhere[0] - inside[0] > 0.05):
             outside = "  <- better outside its anchor"
         print(f"{label:14s} {mode:5s} {anchor:6s} {tw:4d}x{th:<4d} "
               f"{inside[0] if inside else 0:10.3f} {anywhere[0]:9.3f}  "
