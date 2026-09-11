@@ -4,6 +4,11 @@
     "dx": -59,
     "dy": -223
   },
+  "hide/bfstar@c": {
+    "anchor": "c",
+    "dx": -97,
+    "dy": -260
+  },
   "hide/blacklist@c": {
     "anchor": "c",
     "dx": -33,
@@ -59,6 +64,11 @@
     "dx": -85,
     "dy": -220
   },
+  "hide/itemshop": {
+    "anchor": "all",
+    "dx": 266,
+    "dy": 248
+  },
   "hide/lumina@c": {
     "anchor": "c",
     "dx": -65,
@@ -83,6 +93,11 @@
     "anchor": "c",
     "dx": -34,
     "dy": -297
+  },
+  "hide/option@c": {
+    "anchor": "c",
+    "dx": -31,
+    "dy": -238
   },
   "hide/runeinven@c": {
     "anchor": "c",
