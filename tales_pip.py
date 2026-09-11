@@ -2809,7 +2809,11 @@ class TriggerWatcher(QObject):
     for a given client size, so the spot is remembered per preset and only that
     box is re-checked afterwards, which is an order of magnitude cheaper."""
 
-    SWEEP_SCALE = 2       # sweeps run at half resolution
+    SWEEP_SCALE = 2       # how much a big template may be shrunk for a sweep
+    # Shrinking destroys a thin strip of small text: the quick-slot bar scores
+    # 0.57 at half size where it scores 1.00 at full size. Only templates with
+    # this much body on both sides are worth downsampling.
+    MIN_SCALE_SIDE = 48
     REFINE_MARGIN = 6     # px searched around a sweep hit to pin it exactly
 
     def __init__(self, controller):
@@ -2856,7 +2860,7 @@ class TriggerWatcher(QObject):
             self.timer.start(wanted)
 
     def template(self, trigger):
-        """(full gray, half gray) for one trigger, decoded once."""
+        """(full gray, sweep gray, sweep scale) for one trigger, decoded once."""
         cached = self._templates.get(trigger["id"])
         if cached is None:
             if trigger.get("builtin"):
@@ -2865,13 +2869,17 @@ class TriggerWatcher(QObject):
             else:
                 image = decode_png(trigger.get("image", ""))
             if image is None:
-                cached = (None, None)
+                cached = (None, None, 1)
             else:
                 full = to_gray(image)
-                half = _cv2.resize(full, (max(1, full.shape[1] // self.SWEEP_SCALE),
-                                           max(1, full.shape[0] // self.SWEEP_SCALE)),
-                                    interpolation=_cv2.INTER_AREA)
-                cached = (full, half)
+                height, width = full.shape[:2]
+                if min(height, width) >= self.MIN_SCALE_SIDE:
+                    scale = self.SWEEP_SCALE
+                    small = _cv2.resize(full, (width // scale, height // scale),
+                                         interpolation=_cv2.INTER_AREA)
+                else:
+                    scale, small = 1, full
+                cached = (full, small, scale)
             self._templates[trigger["id"]] = cached
         return cached
 
@@ -2942,7 +2950,7 @@ class TriggerWatcher(QObject):
 
     def check_known(self, trigger, preset, client, threshold):
         spot = trigger.get("found", {}).get(preset)
-        full, _ = self.template(trigger)
+        full = self.template(trigger)[0]
         if not spot or full is None:
             return False
         left, top, width, height = client
@@ -2957,15 +2965,14 @@ class TriggerWatcher(QObject):
     def sweep(self, trigger, preset, client, threshold):
         """Half-resolution pass over the trigger's search area, then a
         full-resolution check around the hit so the stored spot is exact."""
-        full, half = self.template(trigger)
+        full, small, scale = self.template(trigger)
         if full is None:
             return False
         left, top, width, height = client
         ax, ay, aw, ah = anchor_box(trigger.get("anchor", "all"), width, height)
-        scale = self.SWEEP_SCALE
         frame = to_gray(grab_screen(left + ax, top + ay, aw, ah,
                                      max(1, aw // scale), max(1, ah // scale)))
-        hit = best_match(frame, half)
+        hit = best_match(frame, small)
         if not hit or hit[0] < threshold:
             return False
         th, tw = full.shape[:2]
