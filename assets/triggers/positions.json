@@ -22,9 +22,9 @@
   "hide/communication@c": {
     "anchor": "c",
     "dx": -195,
-    "dy": -149,
+    "dy": -137,
     "mx": 48,
-    "my": 160
+    "my": 2000
   },
   "hide/content@c": {
     "anchor": "c",
