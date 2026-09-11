@@ -1825,7 +1825,12 @@ class SettingsDialog(QDialog):
         left_layout.addWidget(global_card)
 
         auto_card, auto_layout = make_card("자동 숨김 (화면 감지)")
-        self.chk_auto_hide = QCheckBox("화면에 보이는 것에 따라 PIP 자동 표시 / 숨김")
+        hint_auto = QLabel("게임 화면을 읽어 접속 전이거나 큰 창이 떠 있을 때 PIP를 숨깜니다. "
+                            "가려야 할 창을 직접 더 등록할 수 있습니다.")
+        hint_auto.setObjectName("Caption")
+        hint_auto.setWordWrap(True)
+        auto_layout.addWidget(hint_auto)
+        self.chk_auto_hide = QCheckBox("화면 감지 사용")
         self.chk_auto_hide.toggled.connect(self._commit_auto_hide)
         auto_layout.addWidget(self.chk_auto_hide)
 
@@ -1835,21 +1840,12 @@ class SettingsDialog(QDialog):
         self.trigger_list.currentItemChanged.connect(lambda *_: self._load_trigger_mode())
         auto_layout.addWidget(self.trigger_list)
 
-        mode_row = QHBoxLayout()
-        self.combo_trigger_mode = QComboBox()
-        self.combo_trigger_mode.addItem("이 그래픽이 보이면 숨김", "hide")
-        self.combo_trigger_mode.addItem("이 그래픽이 보여야 표시", "show")
-        self.combo_trigger_mode.currentIndexChanged.connect(self._commit_trigger_mode)
-        mode_row.addWidget(QLabel("선택한 조건"))
-        mode_row.addWidget(self.combo_trigger_mode, 1)
-        auto_layout.addLayout(mode_row)
-
         anchor_row = QHBoxLayout()
         self.combo_trigger_anchor = QComboBox()
         for key, label in TRIGGER_ANCHORS:
             self.combo_trigger_anchor.addItem(label, key)
         self.combo_trigger_anchor.currentIndexChanged.connect(self._commit_trigger_anchor)
-        anchor_row.addWidget(QLabel("찾는 위치"))
+        anchor_row.addWidget(QLabel("선택한 조건을 찾을 위치"))
         anchor_row.addWidget(self.combo_trigger_anchor, 1)
         auto_layout.addLayout(anchor_row)
 
@@ -2504,13 +2500,9 @@ class SettingsDialog(QDialog):
         self._loading += 1
         try:
             self.trigger_list.clear()
-            for trigger in self.controller.auto_hide_triggers():
-                mode = "보여야 표시" if trigger.get("mode") == "show" else "보이면 숨김"
+            for trigger in self.controller.user_triggers():
                 where = dict(TRIGGER_ANCHORS).get(trigger.get("anchor", "all"), "")
-                label = f"{trigger.get('name', '조건')}  · {mode} · {where}"
-                if trigger.get("builtin"):
-                    label += " · 기본 제공"
-                entry = QListWidgetItem(label)
+                entry = QListWidgetItem(f"{trigger.get('name', '조건')}  · {where}")
                 entry.setData(Qt.ItemDataRole.UserRole, trigger["id"])
                 entry.setFlags(entry.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 entry.setCheckState(Qt.CheckState.Checked if trigger.get("enabled", True)
@@ -2526,33 +2518,28 @@ class SettingsDialog(QDialog):
     def update_auto_hide_state(self):
         controller = self.controller
         options = controller.auto_hide_options()
-        count = len(options.get("triggers", []))
+        count = len(controller.user_triggers())
         if not MATCHING_AVAILABLE:
             text = "이 빌드에는 화면 감지 기능이 포함되지 않았습니다."
         elif not options.get("enabled", True):
             text = "꺼져 있습니다."
+        elif controller.auto_hidden:
+            text = (controller.watcher.reason or "조건 감지") + " — PIP를 숨기는 중입니다."
         elif not count:
             text = ("가리고 싶은 창을 게임에서 열어둔 뒤 "
                      "화면에서 추가를 누르고 그 창의 고유한 부분을 드래그하세요.")
-        elif controller.auto_hidden:
-            text = (controller.watcher.reason or "조건 감지") + " — PIP를 숨기는 중입니다."
         else:
-            text = f"감시 중입니다. 등록된 조건 {count}개."
+            text = f"감시 중입니다. 직접 등록한 조건 {count}개."
         self.lbl_auto_hide.setText(text)
 
     def _load_trigger_mode(self):
         trigger = self._selected_trigger()
-        # A bundled trigger's kind and search area come from the build, so
-        # editing them here would only be undone on the next launch.
-        editable = trigger is not None and not trigger.get("builtin")
         self._loading += 1
         try:
-            for combo, field, fallback in (
-                    (self.combo_trigger_mode, "mode", "hide"),
-                    (self.combo_trigger_anchor, "anchor", "all")):
-                combo.setEnabled(editable)
-                index = combo.findData((trigger or {}).get(field, fallback))
-                combo.setCurrentIndex(max(0, index))
+            self.combo_trigger_anchor.setEnabled(trigger is not None)
+            index = self.combo_trigger_anchor.findData(
+                (trigger or {}).get("anchor", "all"))
+            self.combo_trigger_anchor.setCurrentIndex(max(0, index))
         finally:
             self._loading -= 1
 
@@ -2561,18 +2548,8 @@ class SettingsDialog(QDialog):
         if not item:
             return None
         wanted = item.data(Qt.ItemDataRole.UserRole)
-        return next((t for t in self.controller.auto_hide_triggers()
+        return next((t for t in self.controller.user_triggers()
                       if t["id"] == wanted), None)
-
-    def _commit_trigger_mode(self, _index):
-        if self._loading:
-            return
-        trigger = self._selected_trigger()
-        if trigger is None:
-            return
-        self.controller.set_trigger_mode(trigger["id"],
-                                          self.combo_trigger_mode.currentData())
-        self.reload_trigger_list()
 
     def _commit_trigger_anchor(self, _index):
         if self._loading:
@@ -2624,12 +2601,6 @@ class SettingsDialog(QDialog):
     def _delete_trigger(self):
         item = self.trigger_list.currentItem()
         if not item:
-            return
-        if str(item.data(Qt.ItemDataRole.UserRole)).startswith(BUILTIN_PREFIX):
-            QMessageBox.information(
-                self, "안내",
-                "기본 제공 조건은 지울 수 없습니다. "
-                "목록의 체크를 끌면 사용되지 않습니다.")
             return
         if QMessageBox.question(
                 self, "조건 삭제", f"{item.text()} 을(를) 삭제합니다.",
@@ -3229,6 +3200,12 @@ class PipController(QObject):
     def auto_hide_triggers(self):
         return self.auto_hide_options().setdefault("triggers", [])
 
+    def user_triggers(self):
+        """The ones the settings window shows. Bundled conditions are part of
+        the build's behaviour, so they are not presented as something to
+        manage - the master switch is the only control over them."""
+        return [t for t in self.auto_hide_triggers() if not t.get("builtin")]
+
     MIN_TRIGGER_DETAIL = 6.0   # grey standard deviation
 
     def add_trigger(self, image, name=None):
@@ -3252,6 +3229,10 @@ class PipController(QObject):
             "id": str(uuid.uuid4()),
             "name": name or f"조건 {len(triggers) + 1}",
             "enabled": True,
+            # What the user adds is always something to hide behind; the
+            # conditions that decide when PIPs may appear ship with the build.
+            "mode": "hide",
+            "anchor": "all",
             "image": encoded,
             "found": {},
         }
@@ -3279,9 +3260,6 @@ class PipController(QObject):
                 break
         save_config(self.config)
         self.watcher.reload()
-
-    def set_trigger_mode(self, trigger_id, mode):
-        self._set_trigger_field(trigger_id, "mode", mode, TRIGGER_MODES)
 
     def set_trigger_anchor(self, trigger_id, anchor):
         self._set_trigger_field(trigger_id, "anchor", anchor, ANCHOR_KEYS)
