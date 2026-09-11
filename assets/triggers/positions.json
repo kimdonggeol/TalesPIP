@@ -22,7 +22,7 @@
   "hide/communication@c": {
     "anchor": "c",
     "dx": -195,
-    "dy": -137,
+    "dy": -149,
     "mx": 48,
     "my": 2000
   },
@@ -35,6 +35,11 @@
     "anchor": "c",
     "dx": -56,
     "dy": -268
+  },
+  "hide/deposit@c": {
+    "anchor": "c",
+    "dx": -127,
+    "dy": -98
   },
   "hide/equipment@c": {
     "anchor": "c",

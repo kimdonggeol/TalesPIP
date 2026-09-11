@@ -84,6 +84,15 @@ def main():
     if os.path.exists(POSITIONS):
         with open(POSITIONS, encoding="utf-8") as f:
             kept = json.load(f)
+    # A margin widened by hand knows something the recordings do not - that a
+    # window reaches further than it happened to be seen - so never narrow one.
+    for key, entry in offsets.items():
+        before = kept.get(key) or {}
+        for side in ("mx", "my"):
+            widest = max((v for v in (before.get(side), entry.get(side))
+                           if v is not None), default=None)
+            if widest is not None:
+                entry[side] = widest
     added = [k for k in offsets if k not in kept]
     changed = [k for k in offsets if k in kept and kept[k] != offsets[k]]
     kept.update(offsets)
