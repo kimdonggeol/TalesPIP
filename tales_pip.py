@@ -196,7 +196,7 @@ DEFAULT_PROFILE = {"id": "default", "name": "프로필 1"}
 # fixed spot for a given client size, so sweeps are only the cost of finding it
 # the first time; after that one small box is re-checked, faster while it is up
 # so the PIPs come back promptly once the window closes.
-DEFAULT_AUTO_HIDE = {"enabled": True, "sweep_ms": 500, "track_ms": 200,
+DEFAULT_AUTO_HIDE = {"enabled": True, "sweep_ms": 500, "track_ms": 60,
                       "threshold": 92, "triggers": []}
 DEFAULT_CONFIG = {
     "always_on_top": True,
@@ -483,8 +483,72 @@ def grab_screen(x, y, w, h, out_w=None, out_h=None):
             user32.ReleaseDC(0, screen)
 
 
+def grab_client(hwnd, x, y, w, h, out_w=None, out_h=None):
+    """A rectangle of the target's client area, in client coordinates.
+
+    Reading the window's own device context rather than the desktop is worth
+    it twice over: a read costs 0.1ms where a screen read costs 7.8ms whatever
+    its size, and it returns what the game drew even where another window -
+    one of our own PIPs, say - is sitting on top of it.
+
+    This is not PrintWindow, which asks the program to redraw itself and comes
+    back black from a DirectX game. The window's composited surface is real
+    pixels, and they match the screen wherever the screen is not covered."""
+    if not MATCHING_AVAILABLE or w <= 0 or h <= 0 or not hwnd:
+        return None
+    out_w, out_h = out_w or w, out_h or h
+    window = mem = bitmap = None
+    try:
+        window = user32.GetDC(wintypes.HWND(hwnd))
+        if not window:
+            return None
+        mem = gdi32.CreateCompatibleDC(window)
+        bitmap = gdi32.CreateCompatibleBitmap(window, out_w, out_h)
+        gdi32.SelectObject(mem, bitmap)
+        if (out_w, out_h) == (w, h):
+            gdi32.BitBlt(mem, 0, 0, w, h, window, x, y, SRCCOPY)
+        else:
+            gdi32.SetStretchBltMode(mem, HALFTONE)
+            gdi32.StretchBlt(mem, 0, 0, out_w, out_h, window, x, y, w, h, SRCCOPY)
+        buffer = _np.empty((out_h, out_w, 4), dtype=_np.uint8)
+        header = _BITMAPINFOHEADER(ctypes.sizeof(_BITMAPINFOHEADER), out_w,
+                                    -out_h, 1, 32, 0, 0, 0, 0, 0, 0)
+        gdi32.GetDIBits(mem, bitmap, 0, out_h,
+                        buffer.ctypes.data_as(ctypes.c_void_p),
+                        ctypes.byref(header), 0)
+        return buffer[:, :, :3]
+    except Exception:
+        log_exception(dialog=False)
+        return None
+    finally:
+        if bitmap:
+            gdi32.DeleteObject(bitmap)
+        if mem:
+            gdi32.DeleteDC(mem)
+        if window:
+            user32.ReleaseDC(wintypes.HWND(hwnd), window)
+
+
 def to_gray(image):
-    return _cv2.cvtColor(image, _cv2.COLOR_BGR2GRAY) if image is not None else None
+    """None when there is nothing to convert: a read can fail, or come back
+    empty, if the window goes away in the middle of a tick."""
+    if image is None or getattr(image, "size", 0) == 0:
+        return None
+    return _cv2.cvtColor(image, _cv2.COLOR_BGR2GRAY)
+
+
+def correlation(patch, template):
+    """How alike two same-sized images are, on the scale matchTemplate uses.
+    For equal sizes that measure is just Pearson's r, and computing it
+    directly skips the machinery of searching for something already found."""
+    if patch is None or template is None or patch.shape != template.shape:
+        return None
+    a = patch.astype(_np.float32)
+    b = template.astype(_np.float32)
+    a -= a.mean()
+    b -= b.mean()
+    spread = float(_np.sqrt(float((a * a).sum()) * float((b * b).sum())))
+    return float((a * b).sum() / spread) if spread else 0.0
 
 
 def best_match(haystack, needle):
@@ -2786,9 +2850,7 @@ class TriggerWatcher(QObject):
     # this much body on both sides are worth downsampling.
     MIN_SCALE_SIDE = 48
     REFINE_MARGIN = 6     # px searched around a sweep hit to pin it exactly
-    # Past this many separate regions, one read of the whole client is cheaper
-    # than reading each of them: a screen read costs ~7ms whatever its size.
-    FULL_READ_REGIONS = 3
+    GROUP_READ_MIN = 3            # spots in one area worth reading together
     SWEEP_BUDGET_MS = 15          # searching per tick, at most
     SWEEP_BACKOFF_MAX_MS = 4000   # how far a never-seen graphic is pushed out
 
@@ -2833,7 +2895,7 @@ class TriggerWatcher(QObject):
         if not self.usable() or not self.triggers():
             self.timer.stop()
             return
-        wanted = int(self.options().get("track_ms", 150))
+        wanted = int(self.options().get("track_ms", 60))
         if self.timer.interval() != wanted:
             self.timer.setInterval(wanted)
         if not self.timer.isActive():
@@ -2894,28 +2956,18 @@ class TriggerWatcher(QObject):
                 return
 
             now = time.monotonic()
-            known = [t for t in triggers if t.get("found", {}).get(preset)]
             unknown = [t for t in triggers if not t.get("found", {}).get(preset)]
-            due = any(self._due.get(t["id"], 0.0) <= now for t in unknown)
-            # Reading the screen costs about 7ms however small the rectangle,
-            # so past a couple of regions one read of the whole client beats
-            # several small ones and every check works off that one copy.
-            frame = None
-            if len(known) + (1 if due else 0) >= self.FULL_READ_REGIONS:
-                frame = to_gray(grab_screen(left, top, client[2], client[3]))
-
-            located = {t["id"]: self.check_known(t, preset, client, threshold, frame)
-                        for t in triggers}
+            located = self.check_all_known(triggers, preset, client, threshold)
             required = [t for t in triggers if t.get("mode") == "show"]
             self._requirement_unmet = bool(required) and not any(
                 located[t["id"]] for t in required)
-            self._sweep_pass(unknown, located, preset, client, threshold, frame, now)
+            self._sweep_pass(unknown, located, preset, client, threshold, now)
             self._decide(triggers, located)
             self.retime()
         except Exception:
             log_exception(dialog=False)
 
-    def _sweep_pass(self, unknown, located, preset, client, threshold, frame, now):
+    def _sweep_pass(self, unknown, located, preset, client, threshold, now):
         """Searching for a graphic that has never been seen is the expensive
         part, and a window the user simply never opens would otherwise be
         searched for forever. Each miss pushes that trigger further out, up to
@@ -2944,7 +2996,7 @@ class TriggerWatcher(QObject):
             if time.monotonic() - started >= budget:
                 break
             self._cursor += 1
-            if self.sweep(trigger, preset, client, threshold, frame):
+            if self.sweep(trigger, preset, client, threshold):
                 located[trigger["id"]] = True
                 self._backoff.pop(trigger["id"], None)
                 self._due.pop(trigger["id"], None)
@@ -2975,14 +3027,51 @@ class TriggerWatcher(QObject):
             return
         self._set_matched(False)
 
-    def _region(self, client, frame, x, y, w, h):
-        """A rectangle in client coordinates, taken from this tick's copy of
-        the screen when there is one and read on its own when there is not."""
-        if frame is not None:
-            return _np.ascontiguousarray(frame[y:y + h, x:x + w])
-        return to_gray(grab_screen(client[0] + x, client[1] + y, w, h))
+    def check_all_known(self, triggers, preset, client, threshold):
+        """Confirm every graphic that has already been found.
 
-    def check_known(self, trigger, preset, client, threshold, frame=None):
+        A read is cheap but not free, and these spots cluster: the windows all
+        open in the middle, the quick-slot bar sits in one corner. Reading the
+        patch that covers a cluster once and slicing it beats reading each spot
+        on its own, so triggers are grouped by the area they were found in."""
+        located = {t["id"]: False for t in triggers}
+        groups = {}
+        for trigger in triggers:
+            spot = trigger.get("found", {}).get(preset)
+            full = self.template(trigger)[0]
+            if not spot or full is None:
+                continue
+            height, width = full.shape[:2]
+            if (spot[0] < 0 or spot[1] < 0 or spot[0] + width > client[2]
+                    or spot[1] + height > client[3]):
+                continue
+            groups.setdefault(trigger.get("anchor", "all"), []).append(
+                (trigger, spot, full))
+
+        for members in groups.values():
+            patch = box = None
+            if len(members) >= self.GROUP_READ_MIN:
+                box = (min(s[0] for _, s, _ in members),
+                        min(s[1] for _, s, _ in members),
+                        max(s[0] + f.shape[1] for _, s, f in members),
+                        max(s[1] + f.shape[0] for _, s, f in members))
+                patch = self._region(box[0], box[1], box[2] - box[0], box[3] - box[1])
+            for trigger, spot, full in members:
+                height, width = full.shape[:2]
+                if patch is not None:
+                    region = patch[spot[1] - box[1]:spot[1] - box[1] + height,
+                                    spot[0] - box[0]:spot[0] - box[0] + width]
+                else:
+                    region = self._region(spot[0], spot[1], width, height)
+                score = correlation(region, full)
+                located[trigger["id"]] = bool(score is not None and score >= threshold)
+        return located
+
+    def _region(self, x, y, w, h, out_w=None, out_h=None):
+        return to_gray(grab_client(self.controller.target_hwnd, x, y, w, h,
+                                    out_w, out_h))
+
+    def check_known(self, trigger, preset, client, threshold):
         spot = trigger.get("found", {}).get(preset)
         full = self.template(trigger)[0]
         if not spot or full is None:
@@ -2992,10 +3081,11 @@ class TriggerWatcher(QObject):
         th, tw = full.shape[:2]
         if x < 0 or y < 0 or x + tw > width or y + th > height:
             return False
-        hit = best_match(self._region(client, frame, x, y, tw, th), full)
-        return bool(hit and hit[0] >= threshold)
+        # The spot is already known, so this is a yes or no, not a search.
+        score = correlation(self._region(x, y, tw, th), full)
+        return bool(score is not None and score >= threshold)
 
-    def sweep(self, trigger, preset, client, threshold, frame=None):
+    def sweep(self, trigger, preset, client, threshold):
         """A pass over the trigger's search area, then a check around the hit
         so the stored spot is exact."""
         full, small, scale = self.template(trigger)
@@ -3003,10 +3093,8 @@ class TriggerWatcher(QObject):
             return False
         width, height = client[2], client[3]
         ax, ay, aw, ah = anchor_box(trigger.get("anchor", "all"), width, height)
-        area = self._region(client, frame, ax, ay, aw, ah)
-        if scale > 1:
-            area = _cv2.resize(area, (max(1, aw // scale), max(1, ah // scale)),
-                                interpolation=_cv2.INTER_AREA)
+        area = self._region(ax, ay, aw, ah,
+                             max(1, aw // scale), max(1, ah // scale))
         hit = best_match(area, small)
         if not hit or hit[0] < threshold:
             return False
@@ -3015,8 +3103,7 @@ class TriggerWatcher(QObject):
         x = max(0, min(width - tw, ax + hit[1] * scale - margin))
         y = max(0, min(height - th, ay + hit[2] * scale - margin))
         refined = best_match(
-            self._region(client, frame, x, y,
-                          min(tw + margin * 2, width - x),
+            self._region(x, y, min(tw + margin * 2, width - x),
                           min(th + margin * 2, height - y)), full)
         if not refined or refined[0] < threshold:
             return False
