@@ -1448,11 +1448,6 @@ class SettingsDialog(QDialog):
         self.combo_preset.currentIndexChanged.connect(self._on_preset_picked)
         preset_layout.addWidget(self.combo_preset)
 
-        self.edit_preset_name = QLineEdit()
-        self.edit_preset_name.setPlaceholderText("프리셋 이름")
-        self.edit_preset_name.editingFinished.connect(self._commit_preset_name)
-        preset_layout.addWidget(self.edit_preset_name)
-
         self.lbl_preset_res = QLabel("-")
         self.lbl_preset_res.setObjectName("Caption")
         self.lbl_preset_res.setWordWrap(True)
@@ -1816,20 +1811,13 @@ class SettingsDialog(QDialog):
 
     def _preset_caption(self, preset):
         name = self.controller.preset_name(preset)
-        width, height = self.controller.preset_resolution(preset)
         count = len(self.controller.regions_in_preset(preset))
-        res = f"{width}x{height}" if width and height else "해상도 미지정"
         mark = " ●" if preset == self.controller.active_preset else ""
-        return f"{name} — {res} · PIP {count}개{mark}"
+        return f"{name} — PIP {count}개{mark}"
 
     def _load_preset_fields(self):
         preset = self.viewing_preset
         width, height = self.controller.preset_resolution(preset)
-        self._loading += 1
-        try:
-            self.edit_preset_name.setText(self.controller.preset_name(preset))
-        finally:
-            self._loading -= 1
         if width and height:
             self.lbl_preset_res.setText(
                 f"이 프리셋은 {width}x{height} 기준입니다. "
@@ -2191,19 +2179,6 @@ class SettingsDialog(QDialog):
             self._reload_profile_combo()
             self.reload_region_list()
 
-    def _commit_preset_name(self):
-        if self._loading:
-            return
-        name = self.edit_preset_name.text().strip()
-        entry = self.controller.config["presets"][str(self.viewing_preset)]
-        if not name:
-            self.edit_preset_name.setText(entry["name"])
-            return
-        if name != entry["name"]:
-            entry["name"] = name
-            save_config(self.controller.config)
-            self.refresh()
-
     def _hotkey_editor(self, key):
         return (self.profile_hotkey_edit if key == "profile_hotkey"
                 else self.hotkey_edit)
@@ -2426,7 +2401,7 @@ class PipController(QObject):
 
         self.preset_actions = {}
         for preset in range(1, PRESET_COUNT + 1):
-            action = QAction(f"프리셋 {preset}", menu)
+            action = QAction(self.preset_name(preset), menu)
             action.setCheckable(True)
             action.triggered.connect(
                 lambda _=False, p=preset: self.activate_preset(p, from_auto=True))
@@ -2587,7 +2562,12 @@ class PipController(QObject):
         self.update_tray_tooltip()
 
     def preset_name(self, preset):
-        return self.config["presets"][str(preset)]["name"]
+        """Derived, never typed: the resolution is what tells presets apart,
+        so a name field would only ask the user to repeat it."""
+        width, height = self.preset_resolution(preset)
+        if width and height:
+            return f"{width}x{height}"
+        return f"프리셋 {preset}"
 
     def preset_resolution(self, preset):
         entry = self.config["presets"][str(preset)]
@@ -2598,6 +2578,7 @@ class PipController(QObject):
         if (entry["width"], entry["height"]) != (width, height):
             entry["width"], entry["height"] = width, height
             save_config(self.config)
+            self.update_tray_tooltip()
 
     def preset_for_resolution(self, width, height):
         for i in range(1, PRESET_COUNT + 1):
@@ -2615,7 +2596,7 @@ class PipController(QObject):
                 self.activate_preset(preset, from_auto=True)
                 self.notify(
                     "TalesPIP",
-                    f"해상도 {width}x{height} 에 맞춰 {self.preset_name(preset)} 로 전환했습니다.",
+                    f"해상도 {width}x{height} 프리셋으로 전환했습니다.",
                     QSystemTrayIcon.MessageIcon.Information, 3000)
             return
 
@@ -2628,8 +2609,8 @@ class PipController(QObject):
         self.activate_preset(empty, from_auto=True)
         self.notify(
             "TalesPIP",
-            f"새 해상도 {width}x{height} 입니다. 비어 있는 {self.preset_name(empty)} "
-            "로 전환했습니다. 영역을 추가하세요.",
+            f"새 해상도 {width}x{height} 입니다. 비어 있던 프리셋 {empty} "
+            "을(를) 이 해상도에 배정했습니다. 영역을 추가하세요.",
             QSystemTrayIcon.MessageIcon.Information, 4000)
 
     def first_empty_preset(self):
@@ -2996,6 +2977,7 @@ class PipController(QObject):
 
     def update_tray_tooltip(self):
         for preset, action in getattr(self, "preset_actions", {}).items():
+            action.setText(self.preset_name(preset))
             action.setChecked(preset == self.active_preset)
         self.rebuild_profile_menu()
         if hasattr(self, "act_hide"):
