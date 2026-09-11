@@ -125,18 +125,27 @@ MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
 WM_HOTKEY = 0x0312
 HOTKEY_ID = 0xA71C
+HOTKEY_ID_PROFILE = 0xA71D
+HOTKEY_IDS = {"toggle_hotkey": HOTKEY_ID, "profile_hotkey": HOTKEY_ID_PROFILE}
 VK_F1 = 0x70
 DEFAULT_TOGGLE_HOTKEY = {"mods": MOD_CONTROL, "vk": 0x7B, "text": "Ctrl+F12"}
+DEFAULT_PROFILE_HOTKEY = {"mods": MOD_CONTROL, "vk": 0x7A, "text": "Ctrl+F11"}
+# A profile is a set of PIPs inside one preset — typically one per character,
+# since two characters at the same resolution want different regions shown.
+DEFAULT_PROFILE = {"id": "default", "name": "기본"}
 DEFAULT_CONFIG = {
     "always_on_top": True,
     "refresh_ms": 100,
     # Presets follow the game's resolution automatically, so the only
     # shortcut worth a global binding is show/hide.
     "toggle_hotkey": dict(DEFAULT_TOGGLE_HOTKEY),
+    "profile_hotkey": dict(DEFAULT_PROFILE_HOTKEY),
     # Remembered so the app can silently reattach when the target restarts.
     # A preset is a resolution profile: crop percentages only hold for the
     # client size they were drawn at, so each preset remembers its own.
-    "presets": {str(i): {"name": f"프리셋 {i}", "width": None, "height": None}
+    "presets": {str(i): {"name": f"프리셋 {i}", "width": None, "height": None,
+                          "profiles": [dict(DEFAULT_PROFILE)],
+                          "active_profile": DEFAULT_PROFILE["id"]}
                  for i in range(1, PRESET_COUNT + 1)},
     "active_preset": 1,
     # The game paints its cursor into its own frame, so it cannot be cut out.
@@ -151,7 +160,8 @@ DEFAULT_CONFIG = {
     "pip_coords": "relative",
     "regions": [],
 }
-DEFAULT_REGION_OPTS = {"opacity": 100, "click_through": False, "preset": 1}
+DEFAULT_REGION_OPTS = {"opacity": 100, "click_through": False, "preset": 1,
+                        "profile": DEFAULT_PROFILE["id"]}
 # Hotkeys shipped as defaults by earlier versions, replaced on load.
 
 user32 = ctypes.windll.user32
@@ -300,23 +310,24 @@ def normalize_hotkey(value):
 class HotkeyFilter(QAbstractNativeEventFilter):
     """Catches WM_HOTKEY so the shortcut works while another app has focus."""
 
-    def __init__(self, callback):
+    def __init__(self, callbacks):
         super().__init__()
-        self.callback = callback
+        self.callbacks = callbacks
         self._last = None
 
     def nativeEventFilter(self, event_type, message):
         try:
             if event_type in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
                 msg = ctypes.cast(int(message), ctypes.POINTER(wintypes.MSG)).contents
-                if msg.message == WM_HOTKEY and int(msg.wParam) == HOTKEY_ID:
+                callback = self.callbacks.get(int(msg.wParam))
+                if msg.message == WM_HOTKEY and callback:
                     # Qt runs this filter twice per message (dispatcher +
                     # wndproc), which would toggle twice and cancel itself
                     # out. Drop the duplicate, and consume the event.
                     stamp = (msg.time, msg.lParam, msg.wParam)
                     if stamp != self._last:
                         self._last = stamp
-                        self.callback()
+                        callback()
                     return True, 0
         except Exception:
             log_exception(dialog=False)
@@ -483,17 +494,46 @@ def load_config():
         entry = entry if isinstance(entry, dict) else {}
         name = entry.get("name")
         width, height = entry.get("width"), entry.get("height")
+        profiles, seen = [], set()
+        raw_profiles = entry.get("profiles")
+        for prof in raw_profiles if isinstance(raw_profiles, list) else []:
+            if not isinstance(prof, dict):
+                continue
+            pid = str(prof.get("id") or "").strip()
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            label = prof.get("name")
+            profiles.append({
+                "id": pid,
+                "name": label if isinstance(label, str) and label.strip()
+                else f"프로필 {len(profiles) + 1}"})
+        # Configs written before profiles existed: whatever the preset already
+        # holds becomes its single starting profile.
+        if not profiles:
+            profiles = [dict(DEFAULT_PROFILE)]
+        active_profile = entry.get("active_profile")
+        if active_profile not in seen:
+            active_profile = profiles[0]["id"]
         presets[str(i)] = {
             "name": name if isinstance(name, str) and name.strip() else f"프리셋 {i}",
             "width": int(width) if isinstance(width, int) and width > 0 else None,
             "height": int(height) if isinstance(height, int) and height > 0 else None,
+            "profiles": profiles,
+            "active_profile": active_profile,
         }
     config["presets"] = presets
+
+    for region in regions:
+        entry = presets[str(region["preset"])]
+        if region.get("profile") not in {p["id"] for p in entry["profiles"]}:
+            region["profile"] = entry["profiles"][0]["id"]
 
     active = config.get("active_preset")
     config["active_preset"] = active if isinstance(active, int) and 1 <= active <= PRESET_COUNT else 1
 
     config["toggle_hotkey"] = normalize_hotkey(config.get("toggle_hotkey"))
+    config["profile_hotkey"] = normalize_hotkey(config.get("profile_hotkey"))
     # Always-on-top is not user-configurable; a PIP that can hide behind the
     # game window is useless.
     config["always_on_top"] = True
@@ -1368,6 +1408,7 @@ class SettingsDialog(QDialog):
         self.controller = controller
         self._loading = 0
         self.viewing_preset = controller.active_preset
+        self.viewing_profile = controller.active_profile_id(self.viewing_preset)
         self.preview_thumb = None
         self.preview_source = None
         self.preview_timer = QTimer(self)
@@ -1389,10 +1430,7 @@ class SettingsDialog(QDialog):
         title = QLabel(f"TalesPIP <span style='font-size:12px; color:#7d8698;'>"
                         f"v{APP_VERSION}</span>")
         title.setObjectName("Title")
-        subtitle = QLabel(f"만든이 {APP_AUTHOR}")
-        subtitle.setObjectName("Caption")
         left_layout.addWidget(title)
-        left_layout.addWidget(subtitle)
 
         self.lbl_update = QLabel("")
         self.lbl_update.setObjectName("UpdateBadge")
@@ -1406,7 +1444,7 @@ class SettingsDialog(QDialog):
         target_layout.addWidget(self.lbl_status)
         left_layout.addWidget(target_card)
 
-        preset_card, preset_layout = make_card("프리셋 (해상도 프로필)")
+        preset_card, preset_layout = make_card("프리셋 (해상도별)")
         self.combo_preset = QComboBox()
         self.combo_preset.currentIndexChanged.connect(self._on_preset_picked)
         preset_layout.addWidget(self.combo_preset)
@@ -1425,7 +1463,35 @@ class SettingsDialog(QDialog):
         # their labels ("현재 해상도로 지정" rendered as "재 해상도로 지").
         left_layout.addWidget(preset_card)
 
-        list_card, list_layout = make_card("이 프리셋의 PIP")
+        profile_card, profile_layout = make_card("프로필 (캐릭터별)")
+        self.combo_profile = QComboBox()
+        self.combo_profile.currentIndexChanged.connect(self._on_profile_picked)
+        profile_layout.addWidget(self.combo_profile)
+
+        self.edit_profile_name = QLineEdit()
+        self.edit_profile_name.setPlaceholderText("프로필 이름")
+        self.edit_profile_name.editingFinished.connect(self._commit_profile_name)
+        profile_layout.addWidget(self.edit_profile_name)
+
+        profile_row = QHBoxLayout()
+        btn_profile_new = QPushButton("새 프로필")
+        btn_profile_new.clicked.connect(lambda: self._add_profile(copy_current=False))
+        btn_profile_copy = QPushButton("현재 복제")
+        btn_profile_copy.clicked.connect(lambda: self._add_profile(copy_current=True))
+        self.btn_profile_del = QPushButton("삭제")
+        self.btn_profile_del.setObjectName("Danger")
+        self.btn_profile_del.clicked.connect(self._delete_profile)
+        for button in (btn_profile_new, btn_profile_copy, self.btn_profile_del):
+            profile_row.addWidget(button)
+        profile_layout.addLayout(profile_row)
+
+        self.lbl_profile_hint = QLabel("")
+        self.lbl_profile_hint.setObjectName("Caption")
+        self.lbl_profile_hint.setWordWrap(True)
+        profile_layout.addWidget(self.lbl_profile_hint)
+        left_layout.addWidget(profile_card)
+
+        list_card, list_layout = make_card("이 프로필의 PIP")
         self.list_widget = QListWidget()
         # Five stacked cards squeeze this to a couple of rows otherwise.
         self.list_widget.setMinimumHeight(220)
@@ -1508,11 +1574,16 @@ class SettingsDialog(QDialog):
         self.hotkey_edit.captured.connect(self._commit_hotkey)
         hotkey_layout.addWidget(QLabel("PIP 표시 / 숨김"))
         hotkey_layout.addWidget(self.hotkey_edit)
-        btn_clear_hotkey = QPushButton("단축키 해제")
-        btn_clear_hotkey.clicked.connect(lambda: self._commit_hotkey(None))
+        self.profile_hotkey_edit = HotkeyEdit()
+        self.profile_hotkey_edit.captured.connect(
+            lambda hk: self._commit_hotkey(hk, "profile_hotkey"))
+        hotkey_layout.addWidget(QLabel("다음 프로필로 전환"))
+        hotkey_layout.addWidget(self.profile_hotkey_edit)
+        btn_clear_hotkey = QPushButton("단축키 모두 해제")
+        btn_clear_hotkey.clicked.connect(self._clear_hotkeys)
         hotkey_layout.addWidget(btn_clear_hotkey)
-        hint = QLabel("버튼을 누른 뒤 원하는 조합을 입력하세요. "
-                       "게임 중에도 동작하며, 프리셋은 해상도에 따라 자동 전환됩니다.")
+        hint = QLabel("버튼을 누른 뒤 원하는 조합을 입력하세요. 게임 중에도 동작합니다. "
+                       "프리셋은 해상도에 따라 자동 전환되고, 프로필은 이 단축키로 바꿉니다.")
         hint.setObjectName("Caption")
         hint.setWordWrap(True)
         hotkey_layout.addWidget(hint)
@@ -1568,9 +1639,13 @@ class SettingsDialog(QDialog):
         bottom = QHBoxLayout()
         self.lbl_path = QLabel(CONFIG_PATH)
         self.lbl_path.setObjectName("Caption")
+        self.lbl_author = QLabel(f"제작자 {APP_AUTHOR}")
+        self.lbl_author.setObjectName("Caption")
         btn_close = QPushButton("닫기")
         btn_close.clicked.connect(self.accept)
         bottom.addWidget(self.lbl_path, 1)
+        bottom.addWidget(self.lbl_author)
+        bottom.addSpacing(12)
         bottom.addWidget(btn_close)
         right_layout.addLayout(bottom)
 
@@ -1724,6 +1799,8 @@ class SettingsDialog(QDialog):
             self.lbl_hover.setText(f"{hover}%")
             self.spin_refresh.setValue(int(self.controller.config.get("refresh_ms", 100)))
             self.hotkey_edit.set_value(self.controller.config.get("toggle_hotkey"))
+            self.profile_hotkey_edit.set_value(
+                self.controller.config.get("profile_hotkey"))
         finally:
             self._loading -= 1
         self._loading += 1
@@ -1738,6 +1815,7 @@ class SettingsDialog(QDialog):
         if self.controller.latest_version:
             self.show_update(self.controller.latest_version)
         self._load_preset_fields()
+        self._reload_profile_combo()
         self.update_preset_state()
         self.reload_region_list()
 
@@ -1772,7 +1850,8 @@ class SettingsDialog(QDialog):
         self._loading += 1
         try:
             self.list_widget.clear()
-            for region in self.controller.regions_in_preset(self.viewing_preset):
+            for region in self.controller.regions_in_profile(self.viewing_preset,
+                                                              self.viewing_profile):
                 item = QListWidgetItem(region.get("name", "영역"))
                 item.setData(Qt.ItemDataRole.UserRole, region["id"])
                 self.list_widget.addItem(item)
@@ -1787,6 +1866,7 @@ class SettingsDialog(QDialog):
 
     def on_active_preset_changed(self):
         self.viewing_preset = self.controller.active_preset
+        self.viewing_profile = self.controller.active_profile_id(self.viewing_preset)
         self.refresh()
 
     def _selected_id(self):
@@ -2111,7 +2191,9 @@ class SettingsDialog(QDialog):
         preset = self.combo_preset.currentData()
         if preset and preset != self.viewing_preset:
             self.viewing_preset = preset
+            self.viewing_profile = self.controller.active_profile_id(preset)
             self._load_preset_fields()
+            self._reload_profile_combo()
             self.reload_region_list()
 
     def _commit_preset_name(self):
@@ -2127,28 +2209,127 @@ class SettingsDialog(QDialog):
             save_config(self.controller.config)
             self.refresh()
 
-    def _commit_hotkey(self, hotkey):
+    def _hotkey_editor(self, key):
+        return (self.profile_hotkey_edit if key == "profile_hotkey"
+                else self.hotkey_edit)
+
+    def _clear_hotkeys(self):
+        for key in HOTKEY_IDS:
+            self._commit_hotkey(None, key)
+
+    def _commit_hotkey(self, hotkey, key="toggle_hotkey"):
         if self._loading:
             return
-        previous = self.controller.config.get("toggle_hotkey")
-        self.controller.config["toggle_hotkey"] = normalize_hotkey(hotkey)
-        if not self.controller.register_hotkey():
-            self.controller.config["toggle_hotkey"] = previous
-            self.controller.register_hotkey()
-            self.hotkey_edit.set_value(previous)
+        editor = self._hotkey_editor(key)
+        previous = self.controller.config.get(key)
+        self.controller.config[key] = normalize_hotkey(hotkey)
+        if not self.controller.register_hotkey(key):
+            self.controller.config[key] = previous
+            self.controller.register_hotkey(key)
+            editor.set_value(previous)
             QMessageBox.warning(
                 self, "단축키 사용 불가",
                 f"{hotkey['text']} 은(는) 다른 프로그램이 사용 중입니다.\n"
                 "다른 조합을 눌러보세요.")
             return
         save_config(self.controller.config)
-        self.hotkey_edit.set_value(self.controller.config["toggle_hotkey"])
+        editor.set_value(self.controller.config[key])
+        self._reload_profile_combo()
         self.update_preset_state()
 
     def update_preset_state(self):
-        name = self.controller.preset_name(self.controller.active_preset)
+        preset = self.controller.active_preset
+        name = self.controller.preset_name(preset)
+        profile = self.controller.profile_name(preset,
+                                                self.controller.active_profile_id(preset))
         state = "숨김" if self.controller.pips_hidden else "표시 중"
-        self.lbl_preset_state.setText(f"현재 사용 중: {name} ({state})")
+        self.lbl_preset_state.setText(
+            f"현재 사용 중: {name} / {profile} ({state})")
+
+    def _reload_profile_combo(self):
+        controller = self.controller
+        profiles = controller.preset_profiles(self.viewing_preset)
+        active = controller.active_profile_id(self.viewing_preset)
+        if self.viewing_profile not in {p["id"] for p in profiles}:
+            self.viewing_profile = active
+        self._loading += 1
+        try:
+            self.combo_profile.clear()
+            for prof in profiles:
+                count = len(controller.regions_in_profile(self.viewing_preset, prof["id"]))
+                mark = " ●" if prof["id"] == active else ""
+                self.combo_profile.addItem(f"{prof['name']} — PIP {count}개{mark}",
+                                            prof["id"])
+            index = self.combo_profile.findData(self.viewing_profile)
+            self.combo_profile.setCurrentIndex(max(0, index))
+            self.edit_profile_name.setText(
+                controller.profile_name(self.viewing_preset, self.viewing_profile))
+        finally:
+            self._loading -= 1
+        self.btn_profile_del.setEnabled(len(profiles) > 1)
+        hotkey = controller.config.get("profile_hotkey")
+        key_text = hotkey["text"] if hotkey else "단축키 미지정"
+        self.lbl_profile_hint.setText(
+            "같은 해상도에서 캐릭터마다 PIP 세트를 나눠 쓸 수 있습니다. "
+            f"{key_text} 로 다음 프로필로 넘어가며, "
+            "마지막으로 쓴 프로필이 기억됩니다.")
+
+    def _on_profile_picked(self, _index):
+        if self._loading:
+            return
+        profile_id = self.combo_profile.currentData()
+        if not profile_id or profile_id == self.viewing_profile:
+            return
+        self.viewing_profile = profile_id
+        # Picking inside the preset that is actually in use switches the PIPs
+        # too; browsing another preset only changes what the list shows.
+        if self.viewing_preset == self.controller.active_preset:
+            self.controller.set_active_profile(self.viewing_preset, profile_id)
+        else:
+            self._reload_profile_combo()
+            self.reload_region_list()
+
+    def _commit_profile_name(self):
+        if self._loading:
+            return
+        name = self.edit_profile_name.text().strip()
+        for prof in self.controller.preset_profiles(self.viewing_preset):
+            if prof["id"] != self.viewing_profile:
+                continue
+            if not name:
+                self.edit_profile_name.setText(prof["name"])
+            elif name != prof["name"]:
+                prof["name"] = name
+                save_config(self.controller.config)
+                self.controller.update_tray_tooltip()
+                self.refresh()
+            return
+
+    def _add_profile(self, copy_current=False):
+        source = self.viewing_profile if copy_current else None
+        self.viewing_profile = self.controller.add_profile(self.viewing_preset, source)
+        self.refresh()
+        self.edit_profile_name.setFocus()
+        self.edit_profile_name.selectAll()
+
+    def _delete_profile(self):
+        profiles = self.controller.preset_profiles(self.viewing_preset)
+        if len(profiles) < 2:
+            QMessageBox.information(self, "안내",
+                                     "프로필은 최소 하나는 남아 있어야 합니다.")
+            return
+        name = self.controller.profile_name(self.viewing_preset, self.viewing_profile)
+        count = len(self.controller.regions_in_profile(self.viewing_preset,
+                                                        self.viewing_profile))
+        if QMessageBox.question(
+                self, "프로필 삭제",
+                f"{name} 을(를) 삭제합니다. 이 프로필의 PIP {count}개도 함께 사라집니다.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        self.controller.delete_profile(self.viewing_preset, self.viewing_profile)
+        self.viewing_profile = self.controller.active_profile_id(self.viewing_preset)
+        self.refresh()
 
     def _quick_add(self, index):
         if not self.controller.quick_add_slot(index, on_done=self.refresh):
@@ -2158,11 +2339,12 @@ class SettingsDialog(QDialog):
     def _sync_slot_card(self):
         connected = bool(self.controller.target_hwnd
                           and user32.IsWindow(self.controller.target_hwnd))
-        editable = self.viewing_preset == self.controller.active_preset
+        editable = (self.viewing_preset == self.controller.active_preset
+                     and self.viewing_profile == self.controller.active_profile_id())
         for btn in self.slot_buttons.values():
             btn.setEnabled(connected and editable)
         if not editable:
-            self.lbl_slots.setText("사용 중인 프리셋에서만 추가할 수 있습니다.")
+            self.lbl_slots.setText("사용 중인 프로필에서만 추가할 수 있습니다.")
         elif connected:
             self.lbl_slots.setText(
                 "누르면 그 슬롯 한 칸이 PIP로 바로 추가됩니다.")
@@ -2170,6 +2352,13 @@ class SettingsDialog(QDialog):
             self.lbl_slots.setText(f"{TARGET_LABEL} 실행 후 사용할 수 있습니다.")
 
     def _add(self):
+        # The picker always adds to whatever is on screen, so browsing another
+        # preset or profile has to switch to it first or the new PIP vanishes.
+        if (self.viewing_preset != self.controller.active_preset
+                or self.viewing_profile != self.controller.active_profile_id()):
+            QMessageBox.information(
+                self, "안내", "사용 중인 프로필에만 추가할 수 있습니다.")
+            return
         self.controller.begin_add_region(on_done=self.refresh)
 
     def _edit_area(self):
@@ -2201,8 +2390,9 @@ class PipController(QObject):
         self.pips_hidden = False
         self._hotkey_hwnd = None
         self._hotkey_holder = None
-        self._hotkey_registered = False
-        self._hotkey_filter = HotkeyFilter(self.toggle_hidden)
+        self._registered_hotkeys = set()
+        self._hotkey_filter = HotkeyFilter({HOTKEY_ID: self.toggle_hidden,
+                                            HOTKEY_ID_PROFILE: self.cycle_profile})
         QApplication.instance().installNativeEventFilter(self._hotkey_filter)
 
         self.process_timer = QTimer()
@@ -2248,6 +2438,9 @@ class PipController(QObject):
             menu.addAction(action)
             self.preset_actions[preset] = action
         menu.addSeparator()
+        self.profile_menu = menu.addMenu("프로필")
+        self.profile_actions = []
+        menu.addSeparator()
         self.act_hide = QAction("PIP 숨기기", menu)
         self.act_hide.setCheckable(True)
         self.act_hide.triggered.connect(self.toggle_hidden)
@@ -2291,21 +2484,25 @@ class PipController(QObject):
         QTimer.singleShot(2500, self.check_for_updates)
         self.update_tray_tooltip()
 
-        if not self.register_hotkey():
+        if not self.register_hotkeys():
             self.notify(
                 "단축키 등록 실패",
-                f"{self.hotkey_text()} 은(는) 다른 프로그램이 사용 중입니다.\n"
-                "설정에서 다른 조합으로 바꾸세요.",
+                "등록하지 못한 단축키가 있습니다. 다른 프로그램이 "
+                "쓰고 있을 수 있으니 설정에서 다른 조합으로 바꾸세요.",
                 QSystemTrayIcon.MessageIcon.Warning, 5000)
 
     def hotkey_text(self):
         hotkey = self.config.get("toggle_hotkey")
         return hotkey["text"] if hotkey else "없음"
 
-    def register_hotkey(self):
-        """(Re)binds the global show/hide hotkey. True when nothing failed."""
-        self.unregister_hotkey()
-        hotkey = self.config.get("toggle_hotkey")
+    def register_hotkeys(self):
+        """(Re)binds every global hotkey. True when all of them took."""
+        return all([self.register_hotkey(key) for key in HOTKEY_IDS])
+
+    def register_hotkey(self, key="toggle_hotkey"):
+        """(Re)binds one global hotkey. True when nothing failed."""
+        self.unregister_hotkey(key)
+        hotkey = self.config.get(key)
         if not hotkey:
             return True
         if self._hotkey_holder is None:
@@ -2314,16 +2511,19 @@ class PipController(QObject):
             self._hotkey_holder.setWindowFlags(Qt.WindowType.Tool)
             self._hotkey_holder.resize(1, 1)
         self._hotkey_hwnd = int(self._hotkey_holder.winId())
-        if user32.RegisterHotKey(wintypes.HWND(self._hotkey_hwnd), HOTKEY_ID,
+        if user32.RegisterHotKey(wintypes.HWND(self._hotkey_hwnd), HOTKEY_IDS[key],
                                   hotkey["mods"] | MOD_NOREPEAT, hotkey["vk"]):
-            self._hotkey_registered = True
+            self._registered_hotkeys.add(key)
             return True
         return False
 
-    def unregister_hotkey(self):
-        if self._hotkey_hwnd and self._hotkey_registered:
-            user32.UnregisterHotKey(wintypes.HWND(self._hotkey_hwnd), HOTKEY_ID)
-        self._hotkey_registered = False
+    def unregister_hotkey(self, key=None):
+        """No key unregisters the lot — that is what shutdown wants."""
+        for name in ([key] if key else list(self._registered_hotkeys)):
+            if name in self._registered_hotkeys and self._hotkey_hwnd:
+                user32.UnregisterHotKey(wintypes.HWND(self._hotkey_hwnd),
+                                         HOTKEY_IDS[name])
+            self._registered_hotkeys.discard(name)
 
     def activate_preset(self, preset, from_auto=False):
         """Switch to a preset. Showing/hiding is a separate action now."""
@@ -2444,6 +2644,93 @@ class PipController(QObject):
                 return i
         return None
 
+    def preset_profiles(self, preset):
+        return self.config["presets"][str(preset)]["profiles"]
+
+    def active_profile_id(self, preset=None):
+        return self.config["presets"][str(preset or self.active_preset)]["active_profile"]
+
+    def profile_name(self, preset, profile_id):
+        for prof in self.preset_profiles(preset):
+            if prof["id"] == profile_id:
+                return prof["name"]
+        return ""
+
+    def regions_in_profile(self, preset, profile_id):
+        return [r for r in self.config["regions"]
+                 if r.get("preset") == preset and r.get("profile") == profile_id]
+
+    def set_active_profile(self, preset, profile_id, notify=False):
+        """The choice is remembered per preset, so switching resolutions and
+        coming back lands on the profile that was last in use there."""
+        entry = self.config["presets"][str(preset)]
+        if profile_id not in {p["id"] for p in entry["profiles"]}:
+            return
+        changed = entry["active_profile"] != profile_id
+        entry["active_profile"] = profile_id
+        save_config(self.config)
+        if preset == self.active_preset:
+            self.apply_visibility()
+            self.update_tray_tooltip()
+        self.refresh_settings()
+        if changed and notify:
+            self.notify("TalesPIP",
+                         f"프로필 {self.profile_name(preset, profile_id)} 로 전환했습니다.",
+                         QSystemTrayIcon.MessageIcon.Information, 1500)
+
+    def cycle_profile(self):
+        """Global-hotkey handler: next profile in the active preset, wrapping."""
+        try:
+            profiles = self.preset_profiles(self.active_preset)
+            if len(profiles) < 2:
+                return
+            ids = [p["id"] for p in profiles]
+            try:
+                index = ids.index(self.active_profile_id())
+            except ValueError:
+                index = -1
+            self.set_active_profile(self.active_preset,
+                                     ids[(index + 1) % len(ids)], notify=True)
+        except Exception:
+            log_exception(dialog=False)
+
+    def add_profile(self, preset, copy_from=None):
+        """A new profile starts empty, or as a copy of another one's PIPs —
+        a second character usually wants the same layout as a starting point."""
+        entry = self.config["presets"][str(preset)]
+        profile_id = str(uuid.uuid4())
+        entry["profiles"].append(
+            {"id": profile_id, "name": f"프로필 {len(entry['profiles']) + 1}"})
+        if copy_from:
+            for region in self.regions_in_profile(preset, copy_from):
+                clone = copy.deepcopy(region)
+                clone["id"] = str(uuid.uuid4())
+                clone["profile"] = profile_id
+                self.config["regions"].append(clone)
+        save_config(self.config)
+        for region in self.regions_in_profile(preset, profile_id):
+            self.ensure_pip_window(region)
+        self.set_active_profile(preset, profile_id)
+        return profile_id
+
+    def delete_profile(self, preset, profile_id):
+        entry = self.config["presets"][str(preset)]
+        if len(entry["profiles"]) < 2:
+            return False
+        for region in self.regions_in_profile(preset, profile_id):
+            self.config["regions"].remove(region)
+            window = self.pip_windows.pop(region["id"], None)
+            if window:
+                window.hide()
+                window.deleteLater()
+        entry["profiles"] = [p for p in entry["profiles"] if p["id"] != profile_id]
+        save_config(self.config)
+        if entry["active_profile"] == profile_id:
+            self.set_active_profile(preset, entry["profiles"][0]["id"])
+        else:
+            self.refresh_settings()
+        return True
+
     def target_client_size(self):
         if not self.target_hwnd or not user32.IsWindow(self.target_hwnd):
             return None
@@ -2503,6 +2790,7 @@ class PipController(QObject):
         }
         region.update(copy.deepcopy(DEFAULT_REGION_OPTS))
         region["preset"] = preset
+        region["profile"] = self.active_profile_id(preset)
         self.config["regions"].append(region)
         save_config(self.config)
         window = self.ensure_pip_window(region)
@@ -2541,7 +2829,8 @@ class PipController(QObject):
     def region_is_visible(self, region):
         if not self.was_running or not self.target_active or self.pips_hidden:
             return False
-        return region.get("preset") == self.active_preset
+        return (region.get("preset") == self.active_preset
+                 and region.get("profile") == self.active_profile_id())
 
     def apply_visibility(self):
         for region in self.config["regions"]:
@@ -2692,15 +2981,36 @@ class PipController(QObject):
     def on_process_stopped(self):
         self.on_target_lost()
 
+    def rebuild_profile_menu(self):
+        """The tray is the way to switch profiles without a hotkey."""
+        menu = getattr(self, "profile_menu", None)
+        if menu is None:
+            return
+        menu.clear()
+        self.profile_actions = []
+        active = self.active_profile_id()
+        for prof in self.preset_profiles(self.active_preset):
+            action = QAction(prof["name"], menu)
+            action.setCheckable(True)
+            action.setChecked(prof["id"] == active)
+            action.triggered.connect(
+                lambda _=False, p=prof["id"]: self.set_active_profile(self.active_preset, p))
+            menu.addAction(action)
+            self.profile_actions.append(action)
+        menu.setEnabled(bool(self.profile_actions))
+
     def update_tray_tooltip(self):
         for preset, action in getattr(self, "preset_actions", {}).items():
             action.setChecked(preset == self.active_preset)
+        self.rebuild_profile_menu()
         if hasattr(self, "act_hide"):
             self.act_hide.setChecked(self.pips_hidden)
         if not self.was_running or not self.target_hwnd:
             self.tray.setToolTip(f"TalesPIP — {TARGET_LABEL} 실행 대기 중")
             return
         state = f"TalesPIP — {self.preset_name(self.active_preset)}"
+        if len(self.preset_profiles(self.active_preset)) > 1:
+            state += f" / {self.profile_name(self.active_preset, self.active_profile_id())}"
         self.tray.setToolTip(state + (" (숨김)" if self.pips_hidden else ""))
 
     def ensure_pip_window(self, region):
@@ -2837,12 +3147,13 @@ class PipController(QObject):
         preset = self.active_preset
         region = {
             "id": str(uuid.uuid4()),
-            "name": f"영역{len(self.regions_in_preset(preset)) + 1}",
+            "name": f"영역{len(self.regions_in_profile(preset, self.active_profile_id(preset))) + 1}",
             "rel": {"x": x, "y": y, "w": w, "h": h},
             "pip": self.default_pip_for(w, h, x, y),
         }
         region.update(copy.deepcopy(DEFAULT_REGION_OPTS))
         region["preset"] = preset
+        region["profile"] = self.active_profile_id(preset)
         # Stamp the preset with the resolution these percentages were drawn at.
         if self.target_hwnd and user32.IsWindow(self.target_hwnd):
             cw, ch = client_size_of(self.target_hwnd)
