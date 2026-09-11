@@ -2733,7 +2733,12 @@ class TriggerWatcher(QObject):
     # the only way to notice it is to go looking. That phase is worth hurrying
     # through: it happens once per window, and after it the spot is known.
     SWEEP_MIN_GAP_COLD_MS = 0
-    SWEEP_BACKOFF_MAX_MS = 4000   # how far a never-seen graphic is pushed out
+    # How far a graphic that has never been seen is pushed out after a miss.
+    # This is what the wait comes to when a window is opened for the first
+    # time on a session that has been running a while, so it is kept short and
+    # paid for in searching: at four seconds that wait was 2.5s, at one it is
+    # under a second.
+    SWEEP_BACKOFF_MAX_MS = 1000
     # One already found and now missing is almost always a closed window, and
     # reopening it lands on the remembered spot, which costs nothing to check.
     # Searching for it again buys little, so it waits much longer.
