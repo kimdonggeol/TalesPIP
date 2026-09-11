@@ -1847,6 +1847,11 @@ class SettingsDialog(QDialog):
         else:
             self._load_selected()
 
+    def on_active_profile_changed(self):
+        self.viewing_preset = self.controller.active_preset
+        self.viewing_profile = self.controller.active_profile_id(self.viewing_preset)
+        self.refresh()
+
     def on_active_preset_changed(self):
         self.viewing_preset = self.controller.active_preset
         self.viewing_profile = self.controller.active_profile_id(self.viewing_preset)
@@ -2648,7 +2653,10 @@ class PipController(QObject):
         if preset == self.active_preset:
             self.apply_visibility()
             self.update_tray_tooltip()
-        self.refresh_settings()
+        # An open settings window follows the switch instead of just marking
+        # it, so what it shows is always the profile that is on screen.
+        if self.settings_dialog and self.settings_dialog.isVisible():
+            self.settings_dialog.on_active_profile_changed()
         if changed and notify:
             self.notify("TalesPIP",
                          f"프로필 {self.profile_name(preset, profile_id)} 로 전환했습니다.",
