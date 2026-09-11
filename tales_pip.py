@@ -2885,6 +2885,13 @@ class TriggerWatcher(QObject):
                 return
             threshold = self.options().get("threshold", 92) / 100.0
             preset = str(self.controller.active_preset)
+            # Spots are remembered per preset, and a preset is a resolution.
+            # Between the game changing size and the preset catching up, the
+            # two disagree; reading the old preset's spots off the new screen
+            # would answer for the wrong layout, so sit that moment out.
+            stored = self.controller.preset_resolution(self.controller.active_preset)
+            if stored != (None, None) and stored != (client[2], client[3]):
+                return
 
             now = time.monotonic()
             known = [t for t in triggers if t.get("found", {}).get(preset)]
