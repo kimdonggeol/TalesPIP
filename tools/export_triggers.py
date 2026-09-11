@@ -3,7 +3,8 @@
 
 Capture the graphics in TalesPIP first (설정 > 자동 숨김 > 화면에서 추가), then
 run this. Every user trigger in config.json is written to assets/triggers/,
-where the next build picks it up as a built-in.
+into the hide/ or show/ folder matching its mode, where the next build picks it
+up as a built-in.
 
     python tools/export_triggers.py [config.json]
 """
@@ -32,7 +33,10 @@ def main():
     for index, trigger in enumerate(triggers, 1):
         if trigger.get("builtin") or not trigger.get("image"):
             continue
-        path = os.path.join(OUT_DIR, safe_name(trigger.get("name", ""), index) + ".png")
+        mode = trigger.get("mode") if trigger.get("mode") in ("hide", "show") else "hide"
+        folder = os.path.join(OUT_DIR, mode)
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, safe_name(trigger.get("name", ""), index) + ".png")
         with open(path, "wb") as out:
             out.write(base64.b64decode(trigger["image"]))
         print("wrote", os.path.relpath(path, ROOT))

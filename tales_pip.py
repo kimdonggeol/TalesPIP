@@ -2,6 +2,7 @@ import sys
 import os
 import math
 import threading
+import time
 import traceback
 import ctypes
 import base64
@@ -49,6 +50,50 @@ RESOURCE_DIR = _resource_dir()
 # measured once - so one image works for every user.
 BUILTIN_TRIGGER_DIR = os.path.join(RESOURCE_DIR, "assets", "triggers")
 BUILTIN_PREFIX = "builtin:"
+# hide: the graphic is on screen, so something is covering the game.
+# show: the graphic has to be on screen before the PIPs mean anything - the
+# quick-slot bar only appears once a character is actually in the world, which
+# is exactly the "not during login" condition.
+TRIGGER_MODES = ("hide", "show")
+# Most game UI is pinned to an edge or a corner, so a trigger can say where to
+# look. Sweeping a corner instead of the whole client is roughly ten times less
+# work, which is what keeps the search cheap enough to run while playing.
+TRIGGER_ANCHORS = (
+    ("all", "화면 전체"),
+    ("tl", "좌측 상단"), ("t", "상단"), ("tr", "우측 상단"),
+    ("l", "좌측"), ("c", "가운데"), ("r", "우측"),
+    ("bl", "좌측 하단"), ("b", "하단"), ("br", "우측 하단"),
+)
+ANCHOR_KEYS = tuple(key for key, _ in TRIGGER_ANCHORS)
+ANCHOR_MIN_W, ANCHOR_MIN_H = 520, 360
+
+
+def anchor_box(anchor, width, height):
+    """(x, y, w, h) inside a client of this size for one anchor. Generous on
+    purpose: the point is to skip most of the screen, not to be tight."""
+    if anchor not in ANCHOR_KEYS or anchor == "all":
+        return 0, 0, width, height
+    box_w = min(width, max(ANCHOR_MIN_W, width // 3))
+    box_h = min(height, max(ANCHOR_MIN_H, height // 3))
+    if anchor in ("t", "b"):
+        box_w = width
+    if anchor in ("l", "r"):
+        box_h = height
+    if anchor == "c":
+        box_w, box_h = min(width, box_w * 2), min(height, box_h * 2)
+    if anchor in ("tl", "l", "bl"):
+        x = 0
+    elif anchor in ("tr", "r", "br"):
+        x = width - box_w
+    else:
+        x = (width - box_w) // 2
+    if anchor in ("tl", "t", "tr"):
+        y = 0
+    elif anchor in ("bl", "b", "br"):
+        y = height - box_h
+    else:
+        y = (height - box_h) // 2
+    return x, y, box_w, box_h
 ERROR_LOG_PATH = os.path.join(BASE_DIR, "error.log")
 
 
@@ -552,8 +597,8 @@ def set_startup_enabled(enabled):
 
 
 def builtin_trigger_path(key):
-    for name in (key + ".png", key + ".bmp"):
-        path = os.path.join(BUILTIN_TRIGGER_DIR, name)
+    for suffix in (".png", ".bmp"):
+        path = os.path.join(BUILTIN_TRIGGER_DIR, *(key + suffix).split("/"))
         if os.path.exists(path):
             return path
     return None
@@ -570,16 +615,21 @@ def read_image(path):
 
 
 def builtin_trigger_files():
-    """(key, display name, path) for every bundled trigger image."""
+    """(key, display name, mode) for every bundled trigger image. The folder
+    it sits in says which kind of condition it is."""
     found = []
-    try:
-        for name in sorted(os.listdir(BUILTIN_TRIGGER_DIR)):
+    for mode in TRIGGER_MODES:
+        try:
+            names = sorted(os.listdir(os.path.join(BUILTIN_TRIGGER_DIR, mode)))
+        except OSError:
+            continue
+        for name in names:
             stem, ext = os.path.splitext(name)
-            if ext.lower() in (".png", ".bmp"):
-                found.append((stem, stem.replace("_", " "),
-                               os.path.join(BUILTIN_TRIGGER_DIR, name)))
-    except OSError:
-        pass
+            if ext.lower() not in (".png", ".bmp"):
+                continue
+            label, _, anchor = stem.partition("@")
+            found.append((f"{mode}/{stem}", label.replace("_", " "), mode,
+                           anchor if anchor in ANCHOR_KEYS else "all"))
     return found
 
 
@@ -590,13 +640,15 @@ def merge_builtin_triggers(auto):
     by_key = {t.get("builtin"): t for t in auto["triggers"] if t.get("builtin")}
     merged = [t for t in auto["triggers"] if not t.get("builtin")]
     builtins = []
-    for key, label, path in builtin_trigger_files():
+    for key, label, mode, anchor in builtin_trigger_files():
         kept = by_key.get(key)
         builtins.append({
             "id": BUILTIN_PREFIX + key,
             "name": label,
             "enabled": bool(kept.get("enabled", True)) if kept else True,
             "builtin": key,
+            "mode": mode,
+            "anchor": anchor,
             "found": kept.get("found", {}) if kept else {},
         })
     auto["triggers"] = builtins + merged
@@ -625,6 +677,8 @@ def normalize_auto_hide(raw):
             "id": str(trigger.get("id") or uuid.uuid4()),
             "name": name if isinstance(name, str) and name.strip() else "숨김 조건",
             "enabled": bool(trigger.get("enabled", True)),
+            "mode": trigger.get("mode") if trigger.get("mode") in TRIGGER_MODES else "hide",
+            "anchor": trigger.get("anchor") if trigger.get("anchor") in ANCHOR_KEYS else "all",
             "found": {},
         }
         if isinstance(builtin, str):
@@ -1771,14 +1825,33 @@ class SettingsDialog(QDialog):
         left_layout.addWidget(global_card)
 
         auto_card, auto_layout = make_card("자동 숨김 (화면 감지)")
-        self.chk_auto_hide = QCheckBox("등록한 그래픽이 보이면 PIP 숨김")
+        self.chk_auto_hide = QCheckBox("화면에 보이는 것에 따라 PIP 자동 표시 / 숨김")
         self.chk_auto_hide.toggled.connect(self._commit_auto_hide)
         auto_layout.addWidget(self.chk_auto_hide)
 
         self.trigger_list = QListWidget()
         self.trigger_list.setMinimumHeight(96)
         self.trigger_list.itemChanged.connect(self._on_trigger_checked)
+        self.trigger_list.currentItemChanged.connect(lambda *_: self._load_trigger_mode())
         auto_layout.addWidget(self.trigger_list)
+
+        mode_row = QHBoxLayout()
+        self.combo_trigger_mode = QComboBox()
+        self.combo_trigger_mode.addItem("이 그래픽이 보이면 숨김", "hide")
+        self.combo_trigger_mode.addItem("이 그래픽이 보여야 표시", "show")
+        self.combo_trigger_mode.currentIndexChanged.connect(self._commit_trigger_mode)
+        mode_row.addWidget(QLabel("선택한 조건"))
+        mode_row.addWidget(self.combo_trigger_mode, 1)
+        auto_layout.addLayout(mode_row)
+
+        anchor_row = QHBoxLayout()
+        self.combo_trigger_anchor = QComboBox()
+        for key, label in TRIGGER_ANCHORS:
+            self.combo_trigger_anchor.addItem(label, key)
+        self.combo_trigger_anchor.currentIndexChanged.connect(self._commit_trigger_anchor)
+        anchor_row.addWidget(QLabel("찾는 위치"))
+        anchor_row.addWidget(self.combo_trigger_anchor, 1)
+        auto_layout.addLayout(anchor_row)
 
         trigger_row = QHBoxLayout()
         btn_trigger_add = QPushButton("화면에서 추가")
@@ -2432,9 +2505,11 @@ class SettingsDialog(QDialog):
         try:
             self.trigger_list.clear()
             for trigger in self.controller.auto_hide_triggers():
-                label = trigger.get("name", "조건")
+                mode = "보여야 표시" if trigger.get("mode") == "show" else "보이면 숨김"
+                where = dict(TRIGGER_ANCHORS).get(trigger.get("anchor", "all"), "")
+                label = f"{trigger.get('name', '조건')}  · {mode} · {where}"
                 if trigger.get("builtin"):
-                    label += "  · 기본 제공"
+                    label += " · 기본 제공"
                 entry = QListWidgetItem(label)
                 entry.setData(Qt.ItemDataRole.UserRole, trigger["id"])
                 entry.setFlags(entry.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -2445,6 +2520,7 @@ class SettingsDialog(QDialog):
                     self.trigger_list.setCurrentItem(entry)
         finally:
             self._loading -= 1
+        self._load_trigger_mode()
         self.update_auto_hide_state()
 
     def update_auto_hide_state(self):
@@ -2459,11 +2535,54 @@ class SettingsDialog(QDialog):
             text = ("가리고 싶은 창을 게임에서 열어둔 뒤 "
                      "화면에서 추가를 누르고 그 창의 고유한 부분을 드래그하세요.")
         elif controller.auto_hidden:
-            found = controller.watcher.last_hit or "조건"
-            text = f"{found} 을(를) 찾아 PIP를 숨기는 중입니다."
+            text = (controller.watcher.reason or "조건 감지") + " — PIP를 숨기는 중입니다."
         else:
             text = f"감시 중입니다. 등록된 조건 {count}개."
         self.lbl_auto_hide.setText(text)
+
+    def _load_trigger_mode(self):
+        trigger = self._selected_trigger()
+        # A bundled trigger's kind and search area come from the build, so
+        # editing them here would only be undone on the next launch.
+        editable = trigger is not None and not trigger.get("builtin")
+        self._loading += 1
+        try:
+            for combo, field, fallback in (
+                    (self.combo_trigger_mode, "mode", "hide"),
+                    (self.combo_trigger_anchor, "anchor", "all")):
+                combo.setEnabled(editable)
+                index = combo.findData((trigger or {}).get(field, fallback))
+                combo.setCurrentIndex(max(0, index))
+        finally:
+            self._loading -= 1
+
+    def _selected_trigger(self):
+        item = self.trigger_list.currentItem()
+        if not item:
+            return None
+        wanted = item.data(Qt.ItemDataRole.UserRole)
+        return next((t for t in self.controller.auto_hide_triggers()
+                      if t["id"] == wanted), None)
+
+    def _commit_trigger_mode(self, _index):
+        if self._loading:
+            return
+        trigger = self._selected_trigger()
+        if trigger is None:
+            return
+        self.controller.set_trigger_mode(trigger["id"],
+                                          self.combo_trigger_mode.currentData())
+        self.reload_trigger_list()
+
+    def _commit_trigger_anchor(self, _index):
+        if self._loading:
+            return
+        trigger = self._selected_trigger()
+        if trigger is None:
+            return
+        self.controller.set_trigger_anchor(trigger["id"],
+                                            self.combo_trigger_anchor.currentData())
+        self.reload_trigger_list()
 
     def _commit_auto_hide(self, checked):
         if self._loading:
@@ -2697,9 +2816,10 @@ class TriggerWatcher(QObject):
         super().__init__()
         self.controller = controller
         self.matched = False
-        self.last_hit = None
+        self.reason = None
         self._templates = {}
         self._sweep_index = 0
+        self._last_sweep = 0.0
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
 
@@ -2729,8 +2849,7 @@ class TriggerWatcher(QObject):
         if not self.usable() or not self.triggers():
             self.timer.stop()
             return
-        wanted = int(self.options().get("track_ms", 150) if self.matched
-                      else self.options().get("sweep_ms", 500))
+        wanted = int(self.options().get("track_ms", 150))
         if self.timer.interval() != wanted:
             self.timer.setInterval(wanted)
         if not self.timer.isActive():
@@ -2780,21 +2899,46 @@ class TriggerWatcher(QObject):
             preset = str(self.controller.active_preset)
 
             # Known spots first: this is the cheap path and the usual answer.
-            for trigger in triggers:
-                if self.check_known(trigger, preset, client, threshold):
-                    self._set_matched(True, trigger)
-                    self.retime()
-                    return
-            # One sweep per tick, so several triggers never stack into one frame.
-            self._sweep_index = (self._sweep_index + 1) % len(triggers)
-            if self.sweep(triggers[self._sweep_index], preset, client, threshold):
-                self._set_matched(True, triggers[self._sweep_index])
-                self.retime()
-                return
-            self._set_matched(False)
+            located = {t["id"]: self.check_known(t, preset, client, threshold)
+                        for t in triggers}
+            # A sweep is an order of magnitude dearer, so at most one runs per
+            # tick and no more often than sweep_ms. The cheap checks keep their
+            # own pace regardless.
+            missing = [t for t in triggers if not located[t["id"]]]
+            if missing and self._sweep_due():
+                self._sweep_index = (self._sweep_index + 1) % len(missing)
+                target = missing[self._sweep_index]
+                located[target["id"]] = self.sweep(target, preset, client, threshold)
+            self._decide(triggers, located)
             self.retime()
         except Exception:
             log_exception(dialog=False)
+
+    def _sweep_due(self):
+        now = time.monotonic()
+        if now - self._last_sweep < self.options().get("sweep_ms", 500) / 1000.0:
+            return False
+        self._last_sweep = now
+        return True
+
+    def _decide(self, triggers, located):
+        """Two kinds of condition, and hiding wins:
+
+        hide - the graphic is on screen, so something is covering the game
+        show - the graphic must be on screen for the PIPs to mean anything,
+               which is how "only once a character is actually in the world"
+               is expressed"""
+        blocking = next((t for t in triggers
+                          if t.get("mode", "hide") == "hide" and located[t["id"]]), None)
+        if blocking is not None:
+            self._set_matched(True, f"{blocking['name']} 감지됨")
+            return
+        required = [t for t in triggers if t.get("mode") == "show"]
+        if required and not any(located[t["id"]] for t in required):
+            names = " / ".join(t["name"] for t in required[:2])
+            self._set_matched(True, f"{names} 이(가) 아직 보이지 않음")
+            return
+        self._set_matched(False)
 
     def check_known(self, trigger, preset, client, threshold):
         spot = trigger.get("found", {}).get(preset)
@@ -2811,22 +2955,23 @@ class TriggerWatcher(QObject):
         return bool(hit and hit[0] >= threshold)
 
     def sweep(self, trigger, preset, client, threshold):
-        """Half-resolution pass over the whole client, then a full-resolution
-        check around the hit so the stored spot is exact."""
+        """Half-resolution pass over the trigger's search area, then a
+        full-resolution check around the hit so the stored spot is exact."""
         full, half = self.template(trigger)
         if full is None:
             return False
         left, top, width, height = client
+        ax, ay, aw, ah = anchor_box(trigger.get("anchor", "all"), width, height)
         scale = self.SWEEP_SCALE
-        frame = to_gray(grab_screen(left, top, width, height,
-                                     width // scale, height // scale))
+        frame = to_gray(grab_screen(left + ax, top + ay, aw, ah,
+                                     max(1, aw // scale), max(1, ah // scale)))
         hit = best_match(frame, half)
         if not hit or hit[0] < threshold:
             return False
         th, tw = full.shape[:2]
         margin = self.REFINE_MARGIN
-        x = max(0, min(width - tw, hit[1] * scale - margin))
-        y = max(0, min(height - th, hit[2] * scale - margin))
+        x = max(0, min(width - tw, ax + hit[1] * scale - margin))
+        y = max(0, min(height - th, ay + hit[2] * scale - margin))
         area = to_gray(grab_screen(left + x, top + y,
                                     min(tw + margin * 2, width - x),
                                     min(th + margin * 2, height - y)))
@@ -2837,12 +2982,12 @@ class TriggerWatcher(QObject):
         save_config(self.controller.config)
         return True
 
-    def _set_matched(self, matched, trigger=None):
-        self.last_hit = trigger.get("name") if matched and trigger else None
+    def _set_matched(self, matched, reason=None):
+        self.reason = reason if matched else None
         if matched == self.matched:
             return
         self.matched = matched
-        self.controller.on_auto_hide_changed(matched, self.last_hit)
+        self.controller.on_auto_hide_changed(matched, self.reason)
 
 
 class PipController(QObject):
@@ -2863,6 +3008,8 @@ class PipController(QObject):
         self.pips_hidden = False
         self.auto_hidden = False
         self.watcher = TriggerWatcher(self)
+        # Nothing should still be grabbing the screen while Qt tears itself down.
+        QApplication.instance().aboutToQuit.connect(self.watcher.stop)
         self._hotkey_hwnd = None
         self._hotkey_holder = None
         self._registered_hotkeys = set()
@@ -3122,6 +3269,27 @@ class PipController(QObject):
         for trigger in self.auto_hide_triggers():
             if trigger.get("id") == trigger_id:
                 trigger["enabled"] = bool(enabled)
+                break
+        save_config(self.config)
+        self.watcher.reload()
+
+    def set_trigger_mode(self, trigger_id, mode):
+        self._set_trigger_field(trigger_id, "mode", mode, TRIGGER_MODES)
+
+    def set_trigger_anchor(self, trigger_id, anchor):
+        self._set_trigger_field(trigger_id, "anchor", anchor, ANCHOR_KEYS)
+
+    def _set_trigger_field(self, trigger_id, field, value, allowed):
+        if value not in allowed:
+            return
+        for trigger in self.auto_hide_triggers():
+            if trigger.get("id") == trigger_id:
+                if trigger.get(field) == value:
+                    return
+                trigger[field] = value
+                # The area to search changed, so where it was last seen is
+                # no longer something to trust.
+                trigger["found"] = {}
                 break
         save_config(self.config)
         self.watcher.reload()
