@@ -659,6 +659,59 @@ def set_startup_enabled(enabled):
         return False
 
 
+BUILTIN_POSITIONS_PATH = os.path.join(BUILTIN_TRIGGER_DIR, "positions.json")
+
+
+def load_builtin_positions():
+    """Where each bundled graphic sits, as an offset from a corner of the
+    client or from its middle.
+
+    The game centres its windows and pins the quick-slot bar a fixed distance
+    up from the bottom left, so one offset holds at every resolution - checked
+    at 1920x1440, 1920x1080 and 1600x900, where it came out identical. Knowing
+    the place in advance means the usual case never has to go looking for it,
+    which is the difference between a core of searching and none."""
+    try:
+        with open(BUILTIN_POSITIONS_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return {}
+    out = {}
+    for key, entry in (raw if isinstance(raw, dict) else {}).items():
+        if (isinstance(entry, dict) and isinstance(entry.get("dx"), int)
+                and isinstance(entry.get("dy"), int)):
+            out[key] = (entry.get("anchor", "all"), entry["dx"], entry["dy"])
+    return out
+
+
+def anchor_origin(anchor, width, height):
+    """The corner an anchor measures from, or the middle when it names none."""
+    if anchor in ("l", "tl", "bl"):
+        x = 0
+    elif anchor in ("r", "tr", "br"):
+        x = width
+    else:
+        x = width // 2
+    if anchor in ("t", "tl", "tr"):
+        y = 0
+    elif anchor in ("b", "bl", "br"):
+        y = height
+    else:
+        y = height // 2
+    return x, y
+
+
+def expected_spot(trigger, width, height):
+    """Where this graphic should be on a client of this size, or None when the
+    build does not know. A guess, not a memory: it still has to be confirmed."""
+    known = BUILTIN_POSITIONS.get(trigger.get("builtin"))
+    if not known:
+        return None
+    anchor, dx, dy = known
+    ox, oy = anchor_origin(anchor, width, height)
+    return [ox + dx, oy + dy]
+
+
 def builtin_trigger_path(key):
     for suffix in (".png", ".bmp"):
         path = os.path.join(BUILTIN_TRIGGER_DIR, *(key + suffix).split("/"))
@@ -716,6 +769,9 @@ def merge_builtin_triggers(auto):
         })
     auto["triggers"] = builtins + merged
     return auto
+
+
+BUILTIN_POSITIONS = load_builtin_positions()
 
 
 def normalize_auto_hide(raw):
@@ -2742,7 +2798,7 @@ class TriggerWatcher(QObject):
     # One already found and now missing is almost always a closed window, and
     # reopening it lands on the remembered spot, which costs nothing to check.
     # Searching for it again buys little, so it waits much longer.
-    SWEEP_BACKOFF_CLOSED_MS = 15000
+    SWEEP_BACKOFF_CLOSED_MS = 30000
 
     def __init__(self, controller):
         super().__init__()
@@ -2898,7 +2954,8 @@ class TriggerWatcher(QObject):
         waiting = [t for t in triggers if not located[t["id"]]
                     and t["id"] not in self._searching
                     and self._due.get(t["id"], 0.0) <= now]
-        cold = any(not t.get("found", {}).get(preset) for t in waiting)
+        cold = any(not t.get("found", {}).get(preset)
+                    and t.get("builtin") not in BUILTIN_POSITIONS for t in waiting)
         gap = self.SWEEP_MIN_GAP_COLD_MS if cold else self.SWEEP_MIN_GAP_MS
         if now - self._last_routine < gap / 1000.0:
             return
@@ -2958,8 +3015,14 @@ class TriggerWatcher(QObject):
                 self._due.pop(trigger["id"], None)
                 return
             base = self.options().get("sweep_ms", 500)
-            ceiling = (self.SWEEP_BACKOFF_CLOSED_MS
-                        if trigger.get("found", {}).get(preset)
+            # Somewhere to look that is already known - remembered from
+            # before, or an offset that came with the build - means a miss
+            # almost always just says the window is shut. Looking for it again
+            # buys little, so it waits much longer than one nobody has ever
+            # placed.
+            placed = (trigger.get("found", {}).get(preset)
+                       or trigger.get("builtin") in BUILTIN_POSITIONS)
+            ceiling = (self.SWEEP_BACKOFF_CLOSED_MS if placed
                         else self.SWEEP_BACKOFF_MAX_MS)
             wait = min(max(base, self._backoff.get(trigger["id"], 0) * 2), ceiling)
             self._backoff[trigger["id"]] = wait
@@ -3012,10 +3075,16 @@ class TriggerWatcher(QObject):
         patch that covers a cluster once and slicing it beats reading each spot
         on its own, so triggers are grouped by the area they were found in."""
         located = {t["id"]: False for t in triggers}
+        guessed = set()
         groups = {}
         for trigger in triggers:
             spot = trigger.get("found", {}).get(preset)
             full = self.template(trigger)
+            if not spot:
+                # Never seen here, but the build may know where it belongs.
+                spot = expected_spot(trigger, client[2], client[3])
+                if spot:
+                    guessed.add(trigger["id"])
             if not spot or full is None:
                 continue
             height, width = full.shape[:2]
@@ -3041,7 +3110,12 @@ class TriggerWatcher(QObject):
                 else:
                     region = self._region(spot[0], spot[1], width, height)
                 score = correlation(region, full)
-                located[trigger["id"]] = bool(score is not None and score >= threshold)
+                hit = bool(score is not None and score >= threshold)
+                located[trigger["id"]] = hit
+                if hit and trigger["id"] in guessed:
+                    # The guess was right, so it is a memory now.
+                    trigger.setdefault("found", {})[preset] = list(spot)
+                    save_config(self.controller.config)
         return located
 
     def _region(self, x, y, w, h, out_w=None, out_h=None):

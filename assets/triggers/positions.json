@@ -1,0 +1,147 @@
+{
+  "hide/avatar@c": {
+    "anchor": "c",
+    "dx": -59,
+    "dy": -223
+  },
+  "hide/blacklist@c": {
+    "anchor": "c",
+    "dx": -33,
+    "dy": -218
+  },
+  "hide/card@c": {
+    "anchor": "c",
+    "dx": -54,
+    "dy": -334
+  },
+  "hide/communication@c": {
+    "anchor": "c",
+    "dx": -195,
+    "dy": -101
+  },
+  "hide/content@c": {
+    "anchor": "c",
+    "dx": -75,
+    "dy": -338
+  },
+  "hide/crown@c": {
+    "anchor": "c",
+    "dx": -56,
+    "dy": -268
+  },
+  "hide/equipment@c": {
+    "anchor": "c",
+    "dx": -62,
+    "dy": -302
+  },
+  "hide/esc@c": {
+    "anchor": "c",
+    "dx": -19,
+    "dy": -90
+  },
+  "hide/eta@c": {
+    "anchor": "c",
+    "dx": -38,
+    "dy": -256
+  },
+  "hide/event@c": {
+    "anchor": "c",
+    "dx": -30,
+    "dy": -301
+  },
+  "hide/guide@c": {
+    "anchor": "c",
+    "dx": -49,
+    "dy": -287
+  },
+  "hide/holything@c": {
+    "anchor": "c",
+    "dx": -85,
+    "dy": -220
+  },
+  "hide/lumina@c": {
+    "anchor": "c",
+    "dx": -65,
+    "dy": -300
+  },
+  "hide/market@c": {
+    "anchor": "c",
+    "dx": -46,
+    "dy": -348
+  },
+  "hide/mastery@c": {
+    "anchor": "c",
+    "dx": -46,
+    "dy": -205
+  },
+  "hide/message@c": {
+    "anchor": "c",
+    "dx": -186,
+    "dy": -125
+  },
+  "hide/mission@c": {
+    "anchor": "c",
+    "dx": -34,
+    "dy": -297
+  },
+  "hide/runeinven@c": {
+    "anchor": "c",
+    "dx": -62,
+    "dy": -249
+  },
+  "hide/runeskill": {
+    "anchor": "all",
+    "dx": 231,
+    "dy": -189
+  },
+  "hide/shop@c": {
+    "anchor": "c",
+    "dx": -141,
+    "dy": -192
+  },
+  "hide/skin@c": {
+    "anchor": "c",
+    "dx": -56,
+    "dy": -172
+  },
+  "hide/slot@c": {
+    "anchor": "c",
+    "dx": -36,
+    "dy": -142
+  },
+  "hide/soullink@c": {
+    "anchor": "c",
+    "dx": -42,
+    "dy": -238
+  },
+  "hide/story@c": {
+    "anchor": "c",
+    "dx": 251,
+    "dy": -243
+  },
+  "hide/talespass@c": {
+    "anchor": "c",
+    "dx": -40,
+    "dy": -224
+  },
+  "hide/tecith@c": {
+    "anchor": "c",
+    "dx": -217,
+    "dy": -251
+  },
+  "hide/timeplay@c": {
+    "anchor": "c",
+    "dx": -53,
+    "dy": -199
+  },
+  "hide/worldmap@c": {
+    "anchor": "c",
+    "dx": -46,
+    "dy": -337
+  },
+  "show/quickslot@bl": {
+    "anchor": "bl",
+    "dx": 24,
+    "dy": -83
+  }
+}
