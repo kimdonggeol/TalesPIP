@@ -2693,6 +2693,7 @@ class SweepWorker:
 
     def __init__(self):
         self.busy = False
+        self.job = None
         self._result = None
 
     def start(self, hwnd, box, template):
@@ -2747,8 +2748,12 @@ class TriggerWatcher(QObject):
         self._due = {}
         self._backoff = {}
         self._requirement_unmet = False
-        self._inflight = None
-        self.worker = SweepWorker()
+        self._searching = set()
+        # One search keeps a core busy for a few hundredths of a second, so a
+        # handful of them at once shortens a round in proportion. Leave most of
+        # the machine alone: this runs next to a game.
+        self.workers = [SweepWorker()
+                         for _ in range(max(1, min(4, (os.cpu_count() or 2) // 4)))]
         self._was_located = set()
         self._last_routine = 0.0
         self._cursor = 0
@@ -2776,7 +2781,7 @@ class TriggerWatcher(QObject):
         self._templates.clear()
         self._due.clear()
         self._backoff.clear()
-        self._inflight = None
+        self._searching.clear()
         self._was_located = set()
         self._set_matched(False)
         self.retime()
@@ -2841,9 +2846,7 @@ class TriggerWatcher(QObject):
                 return
 
             now = time.monotonic()
-            done = self.worker.take()
-            if done is not None:
-                self._on_searched(done[0])
+            self._collect()
             located = self.check_all_known(triggers, preset, client, threshold)
             required = [t for t in triggers if t.get("mode") == "show"]
             self._requirement_unmet = bool(required) and not any(
@@ -2868,20 +2871,27 @@ class TriggerWatcher(QObject):
         few seconds, so the windows a player never opens settle down to costing
         almost nothing.
 
-        Either way the search itself happens on the worker, one at a time; this
-        only decides what to look for next."""
+        Either way the searching happens on the workers; this only decides what
+        to hand them next."""
         # What was there last time and is not now, worked out before this
         # tick's answer replaces it.
         lost = [t for t in triggers
                  if not located[t["id"]] and t["id"] in self._was_located]
         self._was_located = {i for i, yes in located.items() if yes}
-        if self.worker.busy:
+        free = [w for w in self.workers if not w.busy]
+        if not free:
             return
-        if lost:
-            self._dispatch(lost[0], preset, client, threshold, wide=True)
+        for trigger in lost:
+            if not free:
+                return
+            if trigger["id"] in self._searching:
+                continue
+            self._dispatch(free.pop(), trigger, preset, client, threshold, wide=True)
+        if not free:
             return
 
         waiting = [t for t in triggers if not located[t["id"]]
+                    and t["id"] not in self._searching
                     and self._due.get(t["id"], 0.0) <= now]
         cold = any(not t.get("found", {}).get(preset) for t in waiting)
         gap = self.SWEEP_MIN_GAP_COLD_MS if cold else self.SWEEP_MIN_GAP_MS
@@ -2899,42 +2909,48 @@ class TriggerWatcher(QObject):
         # being searched over and over while the tail never came up.
         waiting.sort(key=lambda t: (t.get("mode") != "show",
                                      self._due.get(t["id"], 0.0)))
-        if self._cursor >= len(waiting):
-            self._cursor = 0
-        trigger = waiting[self._cursor]
-        self._cursor += 1
         self._last_routine = now
-        self._dispatch(trigger, preset, client, threshold)
+        while free and waiting:
+            if self._cursor >= len(waiting):
+                self._cursor = 0
+            self._dispatch(free.pop(), waiting.pop(self._cursor), preset,
+                            client, threshold)
 
-    def _dispatch(self, trigger, preset, client, threshold, wide=False):
+    def _dispatch(self, worker, trigger, preset, client, threshold, wide=False):
         full = self.template(trigger)
         if full is None:
             return
-        width, height = client[2], client[3]
         box = anchor_box("all" if wide else trigger.get("anchor", "all"),
-                          width, height)
-        self._inflight = {"id": trigger["id"], "preset": preset, "box": box,
-                           "client": client, "threshold": threshold}
-        self.worker.start(self.controller.target_hwnd, box, full)
+                          client[2], client[3])
+        worker.job = {"id": trigger["id"], "preset": preset, "box": box,
+                       "client": client, "threshold": threshold}
+        self._searching.add(trigger["id"])
+        worker.start(self.controller.target_hwnd, box, full)
 
-    def _on_searched(self, hit):
-        """The worker found the best likeness in the area it was given. Pin it
+    def _collect(self):
+        for worker in self.workers:
+            done = worker.take()
+            if done is not None:
+                job, worker.job = worker.job, None
+                self._on_searched(job, done[0])
+
+    def _on_searched(self, job, hit):
+        """A worker found the best likeness in the area it was given. Pin it
         down exactly here, where the extra read is small and cheap."""
-        job, self._inflight = self._inflight, None
         if not job:
             return
         try:
+            self._searching.discard(job["id"])
             trigger = next((t for t in self.triggers() if t["id"] == job["id"]), None)
             if trigger is None:
                 return
-            preset, threshold = job["preset"], job["threshold"]
+            preset = job["preset"]
             spot = self._pin_down(trigger, hit, job) if hit else None
             if spot:
                 trigger.setdefault("found", {})[preset] = spot
                 save_config(self.controller.config)
                 self._backoff.pop(trigger["id"], None)
                 self._due.pop(trigger["id"], None)
-                self._cursor = 0
                 return
             base = self.options().get("sweep_ms", 500)
             ceiling = (self.SWEEP_BACKOFF_CLOSED_MS
