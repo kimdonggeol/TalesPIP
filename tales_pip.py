@@ -1825,7 +1825,7 @@ class SettingsDialog(QDialog):
         left_layout.addWidget(global_card)
 
         auto_card, auto_layout = make_card("자동 숨김 (화면 감지)")
-        hint_auto = QLabel("게임 화면을 읽어 접속 전이거나 큰 창이 떠 있을 때 PIP를 숨깜니다. "
+        hint_auto = QLabel("게임 화면을 읽어 접속 전이거나 큰 창이 떠 있을 때 PIP를 숨깁니다. "
                             "가려야 할 창을 직접 더 등록할 수 있습니다.")
         hint_auto.setObjectName("Caption")
         hint_auto.setWordWrap(True)
