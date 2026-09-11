@@ -2678,11 +2678,6 @@ class TriggerWatcher(QObject):
     for a given client size, so the spot is remembered per preset and only that
     box is re-checked afterwards, which is an order of magnitude cheaper."""
 
-    SWEEP_SCALE = 2       # how much a big template may be shrunk for a sweep
-    # Shrinking destroys a thin strip of small text: the quick-slot bar scores
-    # 0.57 at half size where it scores 1.00 at full size. Only templates with
-    # this much body on both sides are worth downsampling.
-    MIN_SCALE_SIDE = 48
     REFINE_MARGIN = 6     # px searched around a sweep hit to pin it exactly
     GROUP_READ_MIN = 3            # spots in one area worth reading together
     SWEEP_BUDGET_MS = 8           # routine searching per tick, at most
@@ -2748,7 +2743,14 @@ class TriggerWatcher(QObject):
             self.timer.start(wanted)
 
     def template(self, trigger):
-        """(full gray, sweep gray, sweep scale) for one trigger, decoded once."""
+        """The graphic to look for, in grey, decoded once.
+
+        Always at its own size. Searching a shrunk copy of the screen would be
+        four times cheaper, but halving puts a graphic at an odd position onto
+        a half-pixel grid and the likeness falls apart: across the shipped
+        conditions a match that is really there scores as low as 0.50 that way,
+        while one that is not reaches 0.91. There is no threshold between
+        those, so the saving is not available at any safe price."""
         cached = self._templates.get(trigger["id"])
         if cached is None:
             if trigger.get("builtin"):
@@ -2756,19 +2758,7 @@ class TriggerWatcher(QObject):
                 image = read_image(path) if path else None
             else:
                 image = decode_png(trigger.get("image", ""))
-            if image is None:
-                cached = (None, None, 1)
-            else:
-                full = to_gray(image)
-                height, width = full.shape[:2]
-                if min(height, width) >= self.MIN_SCALE_SIDE:
-                    scale = self.SWEEP_SCALE
-                    small = _cv2.resize(full, (width // scale, height // scale),
-                                         interpolation=_cv2.INTER_AREA)
-                else:
-                    scale, small = 1, full
-                cached = (full, small, scale)
-            self._templates[trigger["id"]] = cached
+            self._templates[trigger["id"]] = cached = to_gray(image)
         return cached
 
     def tick(self):
@@ -2910,7 +2900,7 @@ class TriggerWatcher(QObject):
         groups = {}
         for trigger in triggers:
             spot = trigger.get("found", {}).get(preset)
-            full = self.template(trigger)[0]
+            full = self.template(trigger)
             if not spot or full is None:
                 continue
             height, width = full.shape[:2]
@@ -2945,7 +2935,7 @@ class TriggerWatcher(QObject):
 
     def check_known(self, trigger, preset, client, threshold):
         spot = trigger.get("found", {}).get(preset)
-        full = self.template(trigger)[0]
+        full = self.template(trigger)
         if not spot or full is None:
             return False
         width, height = client[2], client[3]
@@ -2961,21 +2951,19 @@ class TriggerWatcher(QObject):
         """A pass over the trigger's search area, then a check around the hit
         so the stored spot is exact. wide ignores the anchor and covers the
         whole client, which is what a window that has been dragged needs."""
-        full, small, scale = self.template(trigger)
+        full = self.template(trigger)
         if full is None:
             return False
         width, height = client[2], client[3]
         ax, ay, aw, ah = anchor_box(
             "all" if wide else trigger.get("anchor", "all"), width, height)
-        area = self._region(ax, ay, aw, ah,
-                             max(1, aw // scale), max(1, ah // scale))
-        hit = best_match(area, small)
+        hit = best_match(self._region(ax, ay, aw, ah), full)
         if not hit or hit[0] < threshold:
             return False
         th, tw = full.shape[:2]
         margin = self.REFINE_MARGIN
-        x = max(0, min(width - tw, ax + hit[1] * scale - margin))
-        y = max(0, min(height - th, ay + hit[2] * scale - margin))
+        x = max(0, min(width - tw, ax + hit[1] - margin))
+        y = max(0, min(height - th, ay + hit[2] - margin))
         refined = best_match(
             self._region(x, y, min(tw + margin * 2, width - x),
                           min(th + margin * 2, height - y)), full)
