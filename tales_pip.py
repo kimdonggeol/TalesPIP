@@ -196,7 +196,7 @@ DEFAULT_PROFILE = {"id": "default", "name": "프로필 1"}
 # fixed spot for a given client size, so sweeps are only the cost of finding it
 # the first time; after that one small box is re-checked, faster while it is up
 # so the PIPs come back promptly once the window closes.
-DEFAULT_AUTO_HIDE = {"enabled": True, "sweep_ms": 500, "track_ms": 120,
+DEFAULT_AUTO_HIDE = {"enabled": True, "sweep_ms": 500, "track_ms": 60,
                       "threshold": 92, "triggers": []}
 DEFAULT_CONFIG = {
     "always_on_top": True,
@@ -2907,7 +2907,7 @@ class TriggerWatcher(QObject):
         if not self.usable() or not self.triggers():
             self.timer.stop()
             return
-        wanted = int(self.options().get("track_ms", 120))
+        wanted = int(self.options().get("track_ms", 60))
         if self.timer.interval() != wanted:
             self.timer.setInterval(wanted)
         if not self.timer.isActive():
