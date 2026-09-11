@@ -2784,6 +2784,7 @@ class TriggerWatcher(QObject):
 
     REFINE_MARGIN = 6     # px searched around a sweep hit to pin it exactly
     GROUP_READ_MIN = 3            # spots in one area worth reading together
+    NEAR_MARGIN = 32              # px of drift a known spot is still found in
     SWEEP_MIN_GAP_MS = 400        # no two routine searches closer than this
     # Until a window has been seen once there is nothing to check cheaply, so
     # the only way to notice it is to go looking. That phase is worth hurrying
@@ -3068,15 +3069,16 @@ class TriggerWatcher(QObject):
         self._set_matched(False)
 
     def check_all_known(self, triggers, preset, client, threshold):
-        """Confirm every graphic that has already been found.
+        """Confirm every graphic whose place is known, near enough.
 
-        A read is cheap but not free, and these spots cluster: the windows all
-        open in the middle, the quick-slot bar sits in one corner. Reading the
-        patch that covers a cluster once and slicing it beats reading each spot
-        on its own, so triggers are grouped by the area they were found in."""
+        Not at one exact point: some windows come back a little off where they
+        were last time, and demanding the pixel would send them to the back of
+        the search queue for half a minute. A small margin around the spot
+        costs a fraction of a millisecond and catches the drift, and the place
+        it actually turned up is what gets remembered."""
         located = {t["id"]: False for t in triggers}
         guessed = set()
-        groups = {}
+        members = []
         for trigger in triggers:
             spot = trigger.get("found", {}).get(preset)
             full = self.template(trigger)
@@ -3088,33 +3090,44 @@ class TriggerWatcher(QObject):
             if not spot or full is None:
                 continue
             height, width = full.shape[:2]
-            if (spot[0] < 0 or spot[1] < 0 or spot[0] + width > client[2]
-                    or spot[1] + height > client[3]):
+            margin = self.NEAR_MARGIN
+            x0 = max(0, spot[0] - margin)
+            y0 = max(0, spot[1] - margin)
+            x1 = min(client[2], spot[0] + width + margin)
+            y1 = min(client[3], spot[1] + height + margin)
+            if x1 - x0 < width or y1 - y0 < height:
                 continue
-            groups.setdefault(trigger.get("anchor", "all"), []).append(
-                (trigger, spot, full))
+            members.append((trigger, full, (x0, y0, x1, y1)))
 
-        for members in groups.values():
+        groups = {}
+        for trigger, full, rect in members:
+            groups.setdefault(trigger.get("anchor", "all"), []).append(
+                (trigger, full, rect))
+
+        for group in groups.values():
             patch = box = None
-            if len(members) >= self.GROUP_READ_MIN:
-                box = (min(s[0] for _, s, _ in members),
-                        min(s[1] for _, s, _ in members),
-                        max(s[0] + f.shape[1] for _, s, f in members),
-                        max(s[1] + f.shape[0] for _, s, f in members))
+            if len(group) >= self.GROUP_READ_MIN:
+                box = (min(r[0] for _, _, r in group),
+                        min(r[1] for _, _, r in group),
+                        max(r[2] for _, _, r in group),
+                        max(r[3] for _, _, r in group))
                 patch = self._region(box[0], box[1], box[2] - box[0], box[3] - box[1])
-            for trigger, spot, full in members:
-                height, width = full.shape[:2]
+            for trigger, full, rect in group:
+                x0, y0, x1, y1 = rect
                 if patch is not None:
-                    region = patch[spot[1] - box[1]:spot[1] - box[1] + height,
-                                    spot[0] - box[0]:spot[0] - box[0] + width]
+                    area = patch[y0 - box[1]:y1 - box[1], x0 - box[0]:x1 - box[0]]
+                    area = _np.ascontiguousarray(area)
                 else:
-                    region = self._region(spot[0], spot[1], width, height)
-                score = correlation(region, full)
-                hit = bool(score is not None and score >= threshold)
-                located[trigger["id"]] = hit
-                if hit and trigger["id"] in guessed:
-                    # The guess was right, so it is a memory now.
-                    trigger.setdefault("found", {})[preset] = list(spot)
+                    area = self._region(x0, y0, x1 - x0, y1 - y0)
+                hit = best_match(area, full)
+                if not hit or hit[0] < threshold:
+                    continue
+                located[trigger["id"]] = True
+                spot = [x0 + hit[1], y0 + hit[2]]
+                if trigger.get("found", {}).get(preset) != spot:
+                    # Either the guess was right, or the window came back a
+                    # little off; either way this is where it is now.
+                    trigger.setdefault("found", {})[preset] = spot
                     save_config(self.controller.config)
         return located
 
