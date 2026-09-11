@@ -138,6 +138,10 @@ PIP를 **우클릭**하면 영역 추가·수정·삭제와 마우스 통과를 
 이미 가지고 있는 그림 파일이 있다면 **이미지 파일**로 바로 등록해도 됩니다.
 목록의 체크를 끄면 그 조건만 잠시 끔 수 있습니다.
 
+흔히 쓰는 창은 **기본 제공** 으로 미리 들어 있습니다. 게임 UI는 해상도가 바뀜도
+픽셀 크기가 같아서 눈금 이미지 하나가 모든 해상도에 통합니다.
+지우지는 않고 체크만 끌 수 있습니다.
+
 찾기 전에는 화면 전체를 초당 두 번 훑어보고, 한번 찾으면 그 자리를 해상도별로 기억해
 그 부분만 빠르게 확인합니다. 창을 닫으면 거의 바로 PIP가 돌아옵니다.
 
@@ -179,8 +183,11 @@ PIP도 같이 찍히기 때문입니다. 전체화면 독점 모드에서도 동
 
 ```bash
 pip install pyinstaller
-pyinstaller --noconfirm --onefile --windowed --name TalesPIP --icon assets/TalesPIP.ico tales_pip.py
+pyinstaller --noconfirm --onefile --windowed --name TalesPIP --icon assets/TalesPIP.ico --add-data "assets/triggers;assets/triggers" tales_pip.py
 ```
+
+`--add-data` 는 기본 제공 자동 숨김 조건을 실행 파일에 넣습니다.
+조건을 추가하려면 [assets/triggers](assets/triggers) 를 보세요.
 
 `dist/TalesPIP.exe`가 생성됩니다.
 

@@ -35,7 +35,20 @@ def _base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _resource_dir():
+    """Where files bundled with the build live. A onefile build unpacks them
+    into a temp folder of its own, which is the opposite of what config wants:
+    read-only data has to come from there, not from beside the exe."""
+    return getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+
+
 BASE_DIR = _base_dir()
+RESOURCE_DIR = _resource_dir()
+# Trigger graphics shipped with the build. The game's windows are a fixed pixel
+# size whatever the resolution - the same reason the quick-slot grid can be
+# measured once - so one image works for every user.
+BUILTIN_TRIGGER_DIR = os.path.join(RESOURCE_DIR, "assets", "triggers")
+BUILTIN_PREFIX = "builtin:"
 ERROR_LOG_PATH = os.path.join(BASE_DIR, "error.log")
 
 
@@ -538,10 +551,62 @@ def set_startup_enabled(enabled):
         return False
 
 
+def builtin_trigger_path(key):
+    for name in (key + ".png", key + ".bmp"):
+        path = os.path.join(BUILTIN_TRIGGER_DIR, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def read_image(path):
+    """np.fromfile rather than cv2.imread: the latter cannot open a path with
+    non-ASCII characters on Windows."""
+    try:
+        return _cv2.imdecode(_np.fromfile(path, dtype=_np.uint8), _cv2.IMREAD_COLOR)
+    except Exception:
+        log_exception(dialog=False)
+        return None
+
+
+def builtin_trigger_files():
+    """(key, display name, path) for every bundled trigger image."""
+    found = []
+    try:
+        for name in sorted(os.listdir(BUILTIN_TRIGGER_DIR)):
+            stem, ext = os.path.splitext(name)
+            if ext.lower() in (".png", ".bmp"):
+                found.append((stem, stem.replace("_", " "),
+                               os.path.join(BUILTIN_TRIGGER_DIR, name)))
+    except OSError:
+        pass
+    return found
+
+
+def merge_builtin_triggers(auto):
+    """Keep the bundled triggers in the list without storing their pixels in
+    the user's config: only the on/off state and the remembered spots are
+    theirs, so a new build can replace the image itself."""
+    by_key = {t.get("builtin"): t for t in auto["triggers"] if t.get("builtin")}
+    merged = [t for t in auto["triggers"] if not t.get("builtin")]
+    builtins = []
+    for key, label, path in builtin_trigger_files():
+        kept = by_key.get(key)
+        builtins.append({
+            "id": BUILTIN_PREFIX + key,
+            "name": label,
+            "enabled": bool(kept.get("enabled", True)) if kept else True,
+            "builtin": key,
+            "found": kept.get("found", {}) if kept else {},
+        })
+    auto["triggers"] = builtins + merged
+    return auto
+
+
 def normalize_auto_hide(raw):
     auto = copy.deepcopy(DEFAULT_AUTO_HIDE)
     if not isinstance(raw, dict):
-        return auto
+        return merge_builtin_triggers(auto)
     auto["enabled"] = bool(raw.get("enabled", True))
     for key, low, high in (("sweep_ms", 100, 5000), ("track_ms", 50, 2000),
                             ("threshold", 50, 100)):
@@ -550,23 +615,29 @@ def normalize_auto_hide(raw):
             auto[key] = value
     entries = raw.get("triggers")
     for trigger in entries if isinstance(entries, list) else []:
-        if not isinstance(trigger, dict) or not isinstance(trigger.get("image"), str):
+        if not isinstance(trigger, dict):
+            continue
+        builtin = trigger.get("builtin")
+        if not isinstance(trigger.get("image"), str) and not isinstance(builtin, str):
             continue
         name = trigger.get("name")
         entry = {
             "id": str(trigger.get("id") or uuid.uuid4()),
             "name": name if isinstance(name, str) and name.strip() else "숨김 조건",
             "enabled": bool(trigger.get("enabled", True)),
-            "image": trigger["image"],
             "found": {},
         }
+        if isinstance(builtin, str):
+            entry["builtin"] = builtin
+        else:
+            entry["image"] = trigger["image"]
         found = trigger.get("found")
         for key, spot in (found if isinstance(found, dict) else {}).items():
             if (str(key).isdigit() and isinstance(spot, list) and len(spot) == 2
                     and all(isinstance(n, int) for n in spot)):
                 entry["found"][str(key)] = [spot[0], spot[1]]
         auto["triggers"].append(entry)
-    return auto
+    return merge_builtin_triggers(auto)
 
 
 def load_config():
@@ -2361,7 +2432,10 @@ class SettingsDialog(QDialog):
         try:
             self.trigger_list.clear()
             for trigger in self.controller.auto_hide_triggers():
-                entry = QListWidgetItem(trigger.get("name", "조건"))
+                label = trigger.get("name", "조건")
+                if trigger.get("builtin"):
+                    label += "  · 기본 제공"
+                entry = QListWidgetItem(label)
                 entry.setData(Qt.ItemDataRole.UserRole, trigger["id"])
                 entry.setFlags(entry.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 entry.setCheckState(Qt.CheckState.Checked if trigger.get("enabled", True)
@@ -2431,6 +2505,12 @@ class SettingsDialog(QDialog):
     def _delete_trigger(self):
         item = self.trigger_list.currentItem()
         if not item:
+            return
+        if str(item.data(Qt.ItemDataRole.UserRole)).startswith(BUILTIN_PREFIX):
+            QMessageBox.information(
+                self, "안내",
+                "기본 제공 조건은 지울 수 없습니다. "
+                "목록의 체크를 끌면 사용되지 않습니다.")
             return
         if QMessageBox.question(
                 self, "조건 삭제", f"{item.text()} 을(를) 삭제합니다.",
@@ -2660,7 +2740,11 @@ class TriggerWatcher(QObject):
         """(full gray, half gray) for one trigger, decoded once."""
         cached = self._templates.get(trigger["id"])
         if cached is None:
-            image = decode_png(trigger["image"])
+            if trigger.get("builtin"):
+                path = builtin_trigger_path(trigger["builtin"])
+                image = read_image(path) if path else None
+            else:
+                image = decode_png(trigger.get("image", ""))
             if image is None:
                 cached = (None, None)
             else:
@@ -3024,12 +3108,15 @@ class PipController(QObject):
         return trigger
 
     def delete_trigger(self, trigger_id):
+        if str(trigger_id).startswith(BUILTIN_PREFIX):
+            return False
         options = self.auto_hide_options()
         options["triggers"] = [t for t in options.get("triggers", [])
                                 if t.get("id") != trigger_id]
         save_config(self.config)
         self.watcher.reload()
         self.refresh_settings()
+        return True
 
     def set_trigger_enabled(self, trigger_id, enabled):
         for trigger in self.auto_hide_triggers():
