@@ -147,8 +147,7 @@ try:
         QApplication, QWidget, QMenu, QMessageBox, QLabel,
         QDialog, QListWidget, QListWidgetItem, QPushButton, QHBoxLayout, QVBoxLayout,
         QSystemTrayIcon, QCheckBox, QSpinBox, QSlider, QLineEdit,
-        QStackedWidget, QFrame, QGridLayout, QComboBox, QScrollArea,
-        QFileDialog
+        QStackedWidget, QFrame, QGridLayout, QComboBox, QScrollArea
     )
 except Exception:
     log_exception()
@@ -1888,49 +1887,6 @@ class SettingsDialog(QDialog):
 
         left_layout.addWidget(global_card)
 
-        auto_card, auto_layout = make_card("자동 숨김 (화면 감지)")
-        hint_auto = QLabel("게임 화면을 읽어 접속 전이거나 큰 창이 떠 있을 때 PIP를 숨깁니다. "
-                            "가려야 할 창을 직접 더 등록할 수 있습니다.")
-        hint_auto.setObjectName("Caption")
-        hint_auto.setWordWrap(True)
-        auto_layout.addWidget(hint_auto)
-        self.chk_auto_hide = QCheckBox("화면 감지 사용")
-        self.chk_auto_hide.toggled.connect(self._commit_auto_hide)
-        auto_layout.addWidget(self.chk_auto_hide)
-
-        self.trigger_list = QListWidget()
-        self.trigger_list.setMinimumHeight(96)
-        self.trigger_list.itemChanged.connect(self._on_trigger_checked)
-        self.trigger_list.currentItemChanged.connect(lambda *_: self._load_trigger_mode())
-        auto_layout.addWidget(self.trigger_list)
-
-        anchor_row = QHBoxLayout()
-        self.combo_trigger_anchor = QComboBox()
-        for key, label in TRIGGER_ANCHORS:
-            self.combo_trigger_anchor.addItem(label, key)
-        self.combo_trigger_anchor.currentIndexChanged.connect(self._commit_trigger_anchor)
-        anchor_row.addWidget(QLabel("선택한 조건을 찾을 위치"))
-        anchor_row.addWidget(self.combo_trigger_anchor, 1)
-        auto_layout.addLayout(anchor_row)
-
-        trigger_row = QHBoxLayout()
-        btn_trigger_add = QPushButton("화면에서 추가")
-        btn_trigger_add.clicked.connect(self._add_trigger)
-        btn_trigger_file = QPushButton("이미지 파일")
-        btn_trigger_file.clicked.connect(self._add_trigger_file)
-        btn_trigger_del = QPushButton("삭제")
-        btn_trigger_del.setObjectName("Danger")
-        btn_trigger_del.clicked.connect(self._delete_trigger)
-        for button in (btn_trigger_add, btn_trigger_file, btn_trigger_del):
-            trigger_row.addWidget(button)
-        auto_layout.addLayout(trigger_row)
-
-        self.lbl_auto_hide = QLabel("")
-        self.lbl_auto_hide.setObjectName("Caption")
-        self.lbl_auto_hide.setWordWrap(True)
-        auto_layout.addWidget(self.lbl_auto_hide)
-        left_layout.addWidget(auto_card)
-
         hotkey_card, hotkey_layout = make_card("단축키")
         self.hotkey_edit = HotkeyEdit()
         self.hotkey_edit.captured.connect(self._commit_hotkey)
@@ -2150,9 +2106,6 @@ class SettingsDialog(QDialog):
             # The registry is the source of truth, not config.json.
             self.chk_startup.setChecked(is_startup_enabled())
             self.chk_updates.setChecked(bool(self.controller.config.get("check_updates", True)))
-            self.chk_auto_hide.setChecked(
-                bool(self.controller.auto_hide_options().get("enabled", True)))
-            self.chk_auto_hide.setEnabled(MATCHING_AVAILABLE)
             self.chk_notify.setChecked(bool(self.controller.config.get("notifications", True)))
             self.chk_hover.setChecked(bool(self.controller.config.get("dim_on_hover", True)))
             hover = int(self.controller.config.get("hover_opacity", 60))
@@ -2177,7 +2130,6 @@ class SettingsDialog(QDialog):
             self.show_update(self.controller.latest_version)
         self._load_preset_fields()
         self._reload_profile_combo()
-        self.reload_trigger_list()
         self.update_preset_state()
         self.reload_region_list()
 
@@ -2555,124 +2507,6 @@ class SettingsDialog(QDialog):
             self._load_preset_fields()
             self._reload_profile_combo()
             self.reload_region_list()
-
-    def reload_trigger_list(self):
-        current = None
-        item = self.trigger_list.currentItem()
-        if item:
-            current = item.data(Qt.ItemDataRole.UserRole)
-        self._loading += 1
-        try:
-            self.trigger_list.clear()
-            for trigger in self.controller.user_triggers():
-                where = dict(TRIGGER_ANCHORS).get(trigger.get("anchor", "all"), "")
-                entry = QListWidgetItem(f"{trigger.get('name', '조건')}  · {where}")
-                entry.setData(Qt.ItemDataRole.UserRole, trigger["id"])
-                entry.setFlags(entry.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                entry.setCheckState(Qt.CheckState.Checked if trigger.get("enabled", True)
-                                     else Qt.CheckState.Unchecked)
-                self.trigger_list.addItem(entry)
-                if trigger["id"] == current:
-                    self.trigger_list.setCurrentItem(entry)
-        finally:
-            self._loading -= 1
-        self._load_trigger_mode()
-        self.update_auto_hide_state()
-
-    def update_auto_hide_state(self):
-        controller = self.controller
-        options = controller.auto_hide_options()
-        count = len(controller.user_triggers())
-        if not MATCHING_AVAILABLE:
-            text = "이 빌드에는 화면 감지 기능이 포함되지 않았습니다."
-        elif not options.get("enabled", True):
-            text = "꺼져 있습니다."
-        elif controller.auto_hidden:
-            text = (controller.watcher.reason or "조건 감지") + " — PIP를 숨기는 중입니다."
-        elif not count:
-            text = ("가리고 싶은 창을 게임에서 열어둔 뒤 "
-                     "화면에서 추가를 누르고 그 창의 고유한 부분을 드래그하세요.")
-        else:
-            text = f"감시 중입니다. 직접 등록한 조건 {count}개."
-        self.lbl_auto_hide.setText(text)
-
-    def _load_trigger_mode(self):
-        trigger = self._selected_trigger()
-        self._loading += 1
-        try:
-            self.combo_trigger_anchor.setEnabled(trigger is not None)
-            index = self.combo_trigger_anchor.findData(
-                (trigger or {}).get("anchor", "all"))
-            self.combo_trigger_anchor.setCurrentIndex(max(0, index))
-        finally:
-            self._loading -= 1
-
-    def _selected_trigger(self):
-        item = self.trigger_list.currentItem()
-        if not item:
-            return None
-        wanted = item.data(Qt.ItemDataRole.UserRole)
-        return next((t for t in self.controller.user_triggers()
-                      if t["id"] == wanted), None)
-
-    def _commit_trigger_anchor(self, _index):
-        if self._loading:
-            return
-        trigger = self._selected_trigger()
-        if trigger is None:
-            return
-        self.controller.set_trigger_anchor(trigger["id"],
-                                            self.combo_trigger_anchor.currentData())
-        self.reload_trigger_list()
-
-    def _commit_auto_hide(self, checked):
-        if self._loading:
-            return
-        self.controller.auto_hide_options()["enabled"] = bool(checked)
-        save_config(self.controller.config)
-        self.controller.watcher.reload()
-        self.update_auto_hide_state()
-
-    def _on_trigger_checked(self, item):
-        if self._loading:
-            return
-        self.controller.set_trigger_enabled(
-            item.data(Qt.ItemDataRole.UserRole),
-            item.checkState() == Qt.CheckState.Checked)
-        self.update_auto_hide_state()
-
-    def _add_trigger(self):
-        self.controller.begin_capture_trigger(on_done=self.refresh)
-
-    def _add_trigger_file(self):
-        if not MATCHING_AVAILABLE:
-            QMessageBox.information(self, "안내",
-                                     "이 빌드에는 화면 감지 기능이 포함되지 않았습니다.")
-            return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "숨김 조건으로 쓸 이미지", "",
-            "이미지 (*.png *.jpg *.jpeg *.bmp)")
-        if not path:
-            return
-        image = _cv2.imdecode(
-            _np.fromfile(path, dtype=_np.uint8), _cv2.IMREAD_COLOR)
-        if image is None:
-            QMessageBox.warning(self, "안내", "이미지를 읽지 못했습니다.")
-            return
-        self.controller.add_trigger(image, os.path.splitext(os.path.basename(path))[0])
-        self.refresh()
-
-    def _delete_trigger(self):
-        item = self.trigger_list.currentItem()
-        if not item:
-            return
-        if QMessageBox.question(
-                self, "조건 삭제", f"{item.text()} 을(를) 삭제합니다.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
-            return
-        self.controller.delete_trigger(item.data(Qt.ItemDataRole.UserRole))
-        self.refresh()
 
     def _hotkey_editor(self, key):
         return (self.profile_hotkey_edit if key == "profile_hotkey"
@@ -3382,8 +3216,6 @@ class PipController(QObject):
         self.auto_hidden = matched
         self.apply_visibility()
         self.update_tray_tooltip()
-        if self.settings_dialog and self.settings_dialog.isVisible():
-            self.settings_dialog.update_auto_hide_state()
 
     def auto_hide_options(self):
         return self.config.setdefault("auto_hide", copy.deepcopy(DEFAULT_AUTO_HIDE))
