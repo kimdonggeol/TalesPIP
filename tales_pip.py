@@ -2853,6 +2853,10 @@ class TriggerWatcher(QObject):
     GROUP_READ_MIN = 3            # spots in one area worth reading together
     SWEEP_BUDGET_MS = 8           # routine searching per tick, at most
     SWEEP_MIN_GAP_MS = 400        # and no two routine searches closer than this
+    # Until a window has been seen once there is nothing to check cheaply, so
+    # the only way to notice it is to go looking. That phase is worth hurrying
+    # through: it happens once per window, and after it the spot is known.
+    SWEEP_MIN_GAP_COLD_MS = 150
     SWEEP_BACKOFF_MAX_MS = 4000   # how far a never-seen graphic is pushed out
     # One already found and now missing is almost always a closed window, and
     # reopening it lands on the remembered spot, which costs nothing to check.
@@ -2998,11 +3002,13 @@ class TriggerWatcher(QObject):
         # cannot hold the rate down on its own; searches also keep a minimum
         # gap between them. Together they cap the routine pass at about a
         # tenth of a core however many conditions are waiting.
-        if now - self._last_routine < self.SWEEP_MIN_GAP_MS / 1000.0:
-            self._was_located = {i for i, yes in located.items() if yes}
-            return
         waiting = [t for t in triggers if not located[t["id"]]
                     and self._due.get(t["id"], 0.0) <= now]
+        cold = any(not t.get("found", {}).get(preset) for t in waiting)
+        gap = self.SWEEP_MIN_GAP_COLD_MS if cold else self.SWEEP_MIN_GAP_MS
+        if now - self._last_routine < gap / 1000.0:
+            self._was_located = {i for i, yes in located.items() if yes}
+            return
         # While no show condition has been met the PIPs are hidden already, so
         # what a hide condition would say cannot change the outcome. Search for
         # the one that governs whether they appear at all, and nothing else.
