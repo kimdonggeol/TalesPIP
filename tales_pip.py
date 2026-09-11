@@ -196,7 +196,7 @@ DEFAULT_PROFILE = {"id": "default", "name": "프로필 1"}
 # fixed spot for a given client size, so sweeps are only the cost of finding it
 # the first time; after that one small box is re-checked, faster while it is up
 # so the PIPs come back promptly once the window closes.
-DEFAULT_AUTO_HIDE = {"enabled": True, "sweep_ms": 500, "track_ms": 150,
+DEFAULT_AUTO_HIDE = {"enabled": True, "sweep_ms": 500, "track_ms": 200,
                       "threshold": 92, "triggers": []}
 DEFAULT_CONFIG = {
     "always_on_top": True,
@@ -2786,6 +2786,11 @@ class TriggerWatcher(QObject):
     # this much body on both sides are worth downsampling.
     MIN_SCALE_SIDE = 48
     REFINE_MARGIN = 6     # px searched around a sweep hit to pin it exactly
+    # Past this many separate regions, one read of the whole client is cheaper
+    # than reading each of them: a screen read costs ~7ms whatever its size.
+    FULL_READ_REGIONS = 3
+    SWEEP_BUDGET_MS = 15          # searching per tick, at most
+    SWEEP_BACKOFF_MAX_MS = 4000   # how far a never-seen graphic is pushed out
 
     def __init__(self, controller):
         super().__init__()
@@ -2793,8 +2798,10 @@ class TriggerWatcher(QObject):
         self.matched = False
         self.reason = None
         self._templates = {}
-        self._sweep_index = 0
-        self._last_sweep = 0.0
+        self._due = {}
+        self._backoff = {}
+        self._requirement_unmet = False
+        self._cursor = 0
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
 
@@ -2817,6 +2824,8 @@ class TriggerWatcher(QObject):
     def reload(self):
         """Templates and remembered spots are stale once the list is edited."""
         self._templates.clear()
+        self._due.clear()
+        self._backoff.clear()
         self._set_matched(False)
         self.retime()
 
@@ -2877,28 +2886,67 @@ class TriggerWatcher(QObject):
             threshold = self.options().get("threshold", 92) / 100.0
             preset = str(self.controller.active_preset)
 
-            # Known spots first: this is the cheap path and the usual answer.
-            located = {t["id"]: self.check_known(t, preset, client, threshold)
+            now = time.monotonic()
+            known = [t for t in triggers if t.get("found", {}).get(preset)]
+            unknown = [t for t in triggers if not t.get("found", {}).get(preset)]
+            due = any(self._due.get(t["id"], 0.0) <= now for t in unknown)
+            # Reading the screen costs about 7ms however small the rectangle,
+            # so past a couple of regions one read of the whole client beats
+            # several small ones and every check works off that one copy.
+            frame = None
+            if len(known) + (1 if due else 0) >= self.FULL_READ_REGIONS:
+                frame = to_gray(grab_screen(left, top, client[2], client[3]))
+
+            located = {t["id"]: self.check_known(t, preset, client, threshold, frame)
                         for t in triggers}
-            # A sweep is an order of magnitude dearer, so at most one runs per
-            # tick and no more often than sweep_ms. The cheap checks keep their
-            # own pace regardless.
-            missing = [t for t in triggers if not located[t["id"]]]
-            if missing and self._sweep_due():
-                self._sweep_index = (self._sweep_index + 1) % len(missing)
-                target = missing[self._sweep_index]
-                located[target["id"]] = self.sweep(target, preset, client, threshold)
+            required = [t for t in triggers if t.get("mode") == "show"]
+            self._requirement_unmet = bool(required) and not any(
+                located[t["id"]] for t in required)
+            self._sweep_pass(unknown, located, preset, client, threshold, frame, now)
             self._decide(triggers, located)
             self.retime()
         except Exception:
             log_exception(dialog=False)
 
-    def _sweep_due(self):
-        now = time.monotonic()
-        if now - self._last_sweep < self.options().get("sweep_ms", 500) / 1000.0:
-            return False
-        self._last_sweep = now
-        return True
+    def _sweep_pass(self, unknown, located, preset, client, threshold, frame, now):
+        """Searching for a graphic that has never been seen is the expensive
+        part, and a window the user simply never opens would otherwise be
+        searched for forever. Each miss pushes that trigger further out, up to
+        a few seconds; a large change on screen brings them all back at once so
+        that opening a window is still noticed promptly."""
+        waiting = [t for t in unknown if not located[t["id"]]
+                    and self._due.get(t["id"], 0.0) <= now]
+        # While no show condition has been met the PIPs are hidden already, so
+        # what a hide condition would say cannot change the outcome. Search for
+        # the one that governs whether they appear at all, and nothing else.
+        if self._requirement_unmet:
+            waiting = [t for t in waiting if t.get("mode") == "show"]
+        # A tick only affords a search or two, so the queue rotates. Ordering
+        # by due time alone would not: several triggers share a due time, and
+        # a screen change resets them all, which would leave the head of the
+        # list being searched over and over while the tail never came up.
+        waiting.sort(key=lambda t: (t.get("mode") != "show",
+                                     self._due.get(t["id"], 0.0)))
+        if self._cursor >= len(waiting):
+            self._cursor = 0
+        pending = waiting[self._cursor:] + waiting[:self._cursor]
+        budget = self.SWEEP_BUDGET_MS / 1000.0
+        started = time.monotonic()
+        base = self.options().get("sweep_ms", 500)
+        for trigger in pending:
+            if time.monotonic() - started >= budget:
+                break
+            self._cursor += 1
+            if self.sweep(trigger, preset, client, threshold, frame):
+                located[trigger["id"]] = True
+                self._backoff.pop(trigger["id"], None)
+                self._due.pop(trigger["id"], None)
+                self._cursor = 0
+                break
+            wait = min(max(base, self._backoff.get(trigger["id"], 0) * 2),
+                        self.SWEEP_BACKOFF_MAX_MS)
+            self._backoff[trigger["id"]] = wait
+            self._due[trigger["id"]] = now + wait / 1000.0
 
     def _decide(self, triggers, located):
         """Two kinds of condition, and hiding wins:
@@ -2915,45 +2963,54 @@ class TriggerWatcher(QObject):
         required = [t for t in triggers if t.get("mode") == "show"]
         if required and not any(located[t["id"]] for t in required):
             names = " / ".join(t["name"] for t in required[:2])
-            self._set_matched(True, f"{names} 이(가) 아직 보이지 않음")
+            self._set_matched(
+                True, f"{names} 이(가) 아직 보이지 않음")
             return
         self._set_matched(False)
 
-    def check_known(self, trigger, preset, client, threshold):
+    def _region(self, client, frame, x, y, w, h):
+        """A rectangle in client coordinates, taken from this tick's copy of
+        the screen when there is one and read on its own when there is not."""
+        if frame is not None:
+            return _np.ascontiguousarray(frame[y:y + h, x:x + w])
+        return to_gray(grab_screen(client[0] + x, client[1] + y, w, h))
+
+    def check_known(self, trigger, preset, client, threshold, frame=None):
         spot = trigger.get("found", {}).get(preset)
         full = self.template(trigger)[0]
         if not spot or full is None:
             return False
-        left, top, width, height = client
+        width, height = client[2], client[3]
         x, y = spot
         th, tw = full.shape[:2]
         if x < 0 or y < 0 or x + tw > width or y + th > height:
             return False
-        patch = to_gray(grab_screen(left + x, top + y, tw, th))
-        hit = best_match(patch, full)
+        hit = best_match(self._region(client, frame, x, y, tw, th), full)
         return bool(hit and hit[0] >= threshold)
 
-    def sweep(self, trigger, preset, client, threshold):
-        """Half-resolution pass over the trigger's search area, then a
-        full-resolution check around the hit so the stored spot is exact."""
+    def sweep(self, trigger, preset, client, threshold, frame=None):
+        """A pass over the trigger's search area, then a check around the hit
+        so the stored spot is exact."""
         full, small, scale = self.template(trigger)
         if full is None:
             return False
-        left, top, width, height = client
+        width, height = client[2], client[3]
         ax, ay, aw, ah = anchor_box(trigger.get("anchor", "all"), width, height)
-        frame = to_gray(grab_screen(left + ax, top + ay, aw, ah,
-                                     max(1, aw // scale), max(1, ah // scale)))
-        hit = best_match(frame, small)
+        area = self._region(client, frame, ax, ay, aw, ah)
+        if scale > 1:
+            area = _cv2.resize(area, (max(1, aw // scale), max(1, ah // scale)),
+                                interpolation=_cv2.INTER_AREA)
+        hit = best_match(area, small)
         if not hit or hit[0] < threshold:
             return False
         th, tw = full.shape[:2]
         margin = self.REFINE_MARGIN
         x = max(0, min(width - tw, ax + hit[1] * scale - margin))
         y = max(0, min(height - th, ay + hit[2] * scale - margin))
-        area = to_gray(grab_screen(left + x, top + y,
-                                    min(tw + margin * 2, width - x),
-                                    min(th + margin * 2, height - y)))
-        refined = best_match(area, full)
+        refined = best_match(
+            self._region(client, frame, x, y,
+                          min(tw + margin * 2, width - x),
+                          min(th + margin * 2, height - y)), full)
         if not refined or refined[0] < threshold:
             return False
         trigger.setdefault("found", {})[preset] = [x + refined[1], y + refined[2]]
