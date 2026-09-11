@@ -680,7 +680,13 @@ def load_builtin_positions():
     for key, entry in (raw if isinstance(raw, dict) else {}).items():
         if (isinstance(entry, dict) and isinstance(entry.get("dx"), int)
                 and isinstance(entry.get("dy"), int)):
-            out[key] = (entry.get("anchor", "all"), entry["dx"], entry["dy"])
+            out[key] = {
+                "anchor": entry.get("anchor", "all"),
+                "dx": entry["dx"], "dy": entry["dy"],
+                # A window that does not come back in quite the same place
+                # says how far it wanders; the rest take the usual slack.
+                "mx": entry.get("mx"), "my": entry.get("my"),
+            }
     return out
 
 
@@ -707,9 +713,15 @@ def expected_spot(trigger, width, height):
     known = BUILTIN_POSITIONS.get(trigger.get("builtin"))
     if not known:
         return None
-    anchor, dx, dy = known
-    ox, oy = anchor_origin(anchor, width, height)
-    return [ox + dx, oy + dy]
+    ox, oy = anchor_origin(known["anchor"], width, height)
+    return [ox + known["dx"], oy + known["dy"]]
+
+
+def spot_margins(trigger, fallback):
+    """How far either side of a known spot is worth looking."""
+    known = BUILTIN_POSITIONS.get(trigger.get("builtin")) or {}
+    mx, my = known.get("mx"), known.get("my")
+    return (fallback if mx is None else mx, fallback if my is None else my)
 
 
 def builtin_trigger_path(key):
@@ -3090,11 +3102,11 @@ class TriggerWatcher(QObject):
             if not spot or full is None:
                 continue
             height, width = full.shape[:2]
-            margin = self.NEAR_MARGIN
-            x0 = max(0, spot[0] - margin)
-            y0 = max(0, spot[1] - margin)
-            x1 = min(client[2], spot[0] + width + margin)
-            y1 = min(client[3], spot[1] + height + margin)
+            mx, my = spot_margins(trigger, self.NEAR_MARGIN)
+            x0 = max(0, spot[0] - mx)
+            y0 = max(0, spot[1] - my)
+            x1 = min(client[2], spot[0] + width + mx)
+            y1 = min(client[3], spot[1] + height + my)
             if x1 - x0 < width or y1 - y0 < height:
                 continue
             members.append((trigger, full, (x0, y0, x1, y1)))

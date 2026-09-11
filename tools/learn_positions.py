@@ -20,6 +20,9 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 POSITIONS = os.path.join(ROOT, "assets", "triggers", "positions.json")
+DEFAULT_MARGIN = 32     # matches NEAR_MARGIN in tales_pip.py
+SLACK = 48              # room beyond the wandering actually seen
+WANDER_LIMIT = 250      # past this it was dragged, not wandering
 
 
 def origin(anchor, width, height):
@@ -61,11 +64,21 @@ def main():
             seen.add((spot[0] - ox, spot[1] - oy))
         if not seen:
             continue
-        if len(seen) > 1:
+        xs = [x for x, _ in seen]
+        ys = [y for _, y in seen]
+        spread = max(max(xs) - min(xs), max(ys) - min(ys))
+        if spread > WANDER_LIMIT:
             conflicts.append((key, sorted(seen)))
             continue
-        dx, dy = seen.pop()
-        offsets[key] = {"anchor": anchor, "dx": dx, "dy": dy}
+        entry = {"anchor": anchor,
+                  "dx": (max(xs) + min(xs)) // 2,
+                  "dy": (max(ys) + min(ys)) // 2}
+        # Seen in more than one place: say how far it wanders, with room to
+        # spare, so the check covers the whole range rather than one point.
+        if len(seen) > 1:
+            entry["mx"] = max(DEFAULT_MARGIN, (max(xs) - min(xs)) // 2 + SLACK)
+            entry["my"] = max(DEFAULT_MARGIN, (max(ys) - min(ys)) // 2 + SLACK)
+        offsets[key] = entry
 
     kept = {}
     if os.path.exists(POSITIONS):
@@ -83,13 +96,15 @@ def main():
     print(f"  {len(added)} new, {len(changed)} updated")
     for key in sorted(added):
         entry = kept[key]
-        print(f"    + {key:28s} {entry['anchor']:4s} {entry['dx']:5d}, {entry['dy']:5d}")
+        print(f"    + {key:28s} {entry['anchor']:4s} {entry['dx']:5d}, {entry['dy']:5d}"
+              + (f"   wanders +-{entry['mx']},{entry['my']}" if entry.get("mx") else ""))
     for key in sorted(changed):
         entry = kept[key]
-        print(f"    ~ {key:28s} {entry['anchor']:4s} {entry['dx']:5d}, {entry['dy']:5d}")
+        print(f"    ~ {key:28s} {entry['anchor']:4s} {entry['dx']:5d}, {entry['dy']:5d}"
+              + (f"   wanders +-{entry['mx']},{entry['my']}" if entry.get("mx") else ""))
     for key, seen in conflicts:
-        print(f"    ! {key} was in different places at different resolutions: {seen}")
-        print("      it was probably dragged while being recorded; record it again")
+        print(f"    ! {key} turned up {WANDER_LIMIT}px apart or more: {seen}")
+        print("      that is a drag rather than a wander; record it again")
 
 
 if __name__ == "__main__":

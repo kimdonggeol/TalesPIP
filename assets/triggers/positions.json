@@ -22,7 +22,9 @@
   "hide/communication@c": {
     "anchor": "c",
     "dx": -195,
-    "dy": -101
+    "dy": -149,
+    "mx": 48,
+    "my": 160
   },
   "hide/content@c": {
     "anchor": "c",
@@ -64,6 +66,11 @@
     "dx": -85,
     "dy": -220
   },
+  "hide/inventory@c": {
+    "anchor": "c",
+    "dx": 131,
+    "dy": -108
+  },
   "hide/itemshop": {
     "anchor": "all",
     "dx": 266,
@@ -94,10 +101,25 @@
     "dx": -34,
     "dy": -297
   },
+  "hide/nenyafflediary@c": {
+    "anchor": "c",
+    "dx": -35,
+    "dy": -223
+  },
+  "hide/nenyafflelp@c": {
+    "anchor": "c",
+    "dx": 191,
+    "dy": -240
+  },
   "hide/option@c": {
     "anchor": "c",
     "dx": -31,
     "dy": -238
+  },
+  "hide/reform@c": {
+    "anchor": "c",
+    "dx": -225,
+    "dy": -113
   },
   "hide/runeinven@c": {
     "anchor": "c",
